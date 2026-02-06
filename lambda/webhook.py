@@ -35,7 +35,7 @@ TOOL_STATUS_MAP = {
     "read_documentation": "AWSドキュメントを読んでいます...",
     "recommend": "関連ドキュメントを探しています...",
     "rss": "AWS What's New RSSを取得しています...",
-    "clear_memory": "会話の記憶をクリアしています...",
+    "clear_memory": "会話の記憶をクリアしました！",
 }
 
 
@@ -139,7 +139,10 @@ def process_sse_stream(reply_to: str, response) -> None:
                     # ツール前のテキストは途中応答なので捨てる
                     text_buffer = ""
                     tool_name = tool_use.get("name", "unknown")
-                    status_text = TOOL_STATUS_MAP.get(tool_name, f"{tool_name} を実行しています...")
+                    status_text = next(
+                        (msg for key, msg in TOOL_STATUS_MAP.items() if key in tool_name),
+                        f"{tool_name} を実行しています...",
+                    )
                     throttled_send(status_text)
                 continue
 

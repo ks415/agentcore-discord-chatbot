@@ -20,20 +20,23 @@ Strands Agents でウェブ検索（Tavily API）やAWSドキュメント検索�
 # 依存パッケージのインストール
 npm install
 
+# TypeScript のビルド（CDK コードの型チェック）
+npx tsc
+
 # CDK の差分確認
 npx cdk diff --profile sandbox
+
+# デプロイ前に環境変数をシェルに読み込む（CDKが process.env 経由で参照するため必須）
+set -a && source .env.local && set +a
 
 # フルデプロイ（CDK + Lambda + AgentCore Runtime すべて）
 npx cdk deploy --profile sandbox
 
-# 高速デプロイ（AgentCore Runtime の Docker イメージのみ）
+# 高速デプロイ（AgentCore Runtime の Docker イメージのみ更新）
 npx cdk deploy --hotswap --profile sandbox
-
-# TypeScript のビルド（CDK コードの型チェック）
-npx tsc
 ```
 
-環境変数は `.env.local` から読み込まれる（`bin/agentcore-line-chatbot.ts` で `dotenv.config`）。テンプレートは `.env.example` を参照。
+環境変数は `.env.local` に定義（テンプレート: `.env.example`）。`bin/agentcore-line-chatbot.ts` で `dotenv.config` により CDK 実行時に読み込まれるが、`--hotswap` デプロイ時は `set -a && source .env.local && set +a` でシェルにも展開が必要。
 
 ## アーキテクチャ
 
@@ -62,5 +65,13 @@ AgentCore Runtime (Docker コンテナ)
 - VTL テンプレートで `$util.escapeJavaScript($input.body)` により raw body を保持（LINE 署名検証に必須）
 - Lambda の ARM64 アーキテクチャと bundling の `platform: "linux/arm64"` は必ず一致させること
 - AgentCore の SSE には2種類のイベントがある: Bedrock Converse Stream 形式（dict）のみ処理し、Strands 生イベント（str）は無視する
-- Agent にツールを追加する場合、`TOOL_STATUS_MAP`（`lambda/webhook.py`）にもエントリを追加して LINE 上でツール実行状況を表示する
 - AWS Knowledge MCP Server (`https://knowledge-mcp.global.api.aws`) は認証不要。`MCPClient` + `streamablehttp_client` で接続し、Agent の tools に直接渡す
+- **BedrockAgentCoreApp の import は `from bedrock_agentcore import BedrockAgentCoreApp` を使うこと**。`from bedrock_agentcore.runtime import ...` だと GenAI Observability のトレースが出力されない
+- Agent の Docker コンテナは `opentelemetry-instrument python agent.py` で起動（`agent/Dockerfile` の CMD）。OTel の設定は CDK 側の環境変数で注入
+- LINE Push Message のテキスト上限は 5000 文字。`webhook.py` で `[:5000]` にトランケートしている
+- セッション管理は `reply_to`（user_id or group_id）を `runtimeSessionId` として使い、AgentCore が同じコンテナにルーティング。コンテナのアイドルタイムアウト（15分）で自動破棄
+
+## Agent にツールを追加する手順
+新しいツールを追加する場合、以下の2箇所を同時に変更すること:
+1. `agent/agent.py` — ツール関数を定義し、`_get_or_create_agent()` 内の `tools=` リストに追加。`SYSTEM_PROMPT` にもツールの説明と使い分けルールを追記
+2. `lambda/webhook.py` — `TOOL_STATUS_MAP` にツール名とLINE上で表示するステータスメッセージを追加（例: `"my_tool": "処理中です..."`)

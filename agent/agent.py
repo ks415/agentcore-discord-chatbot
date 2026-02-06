@@ -1,10 +1,9 @@
 import json
 import logging
 import os
-import time
 import urllib.request
 
-from bedrock_agentcore.runtime import BedrockAgentCoreApp
+from bedrock_agentcore import BedrockAgentCoreApp
 from mcp.client.streamable_http import streamablehttp_client
 from strands import Agent, tool
 from strands.models import BedrockModel
@@ -16,8 +15,6 @@ logger.setLevel(logging.INFO)
 
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
-
-SESSION_TTL_SECONDS = 15 * 60  # 15分
 
 # 現在処理中のセッションID（ツールからセッション操作するために使用）
 _current_session_id: str | None = None
@@ -31,8 +28,7 @@ def clear_memory() -> str:
         クリア結果のメッセージ
     """
     if _current_session_id and _current_session_id in _agent_sessions:
-        agent, _ = _agent_sessions[_current_session_id]
-        agent.messages.clear()
+        _agent_sessions[_current_session_id].messages.clear()
         del _agent_sessions[_current_session_id]
         logger.info(f"Session cleared by tool: {_current_session_id}")
     return "会話の記憶をクリアしました。"
@@ -85,6 +81,7 @@ def web_search(query: str) -> str:
 
 SYSTEM_PROMPT = """あなたはLINEで動くアシスタント「みのるんAI」です。
 ユーザーからの質問や依頼に応じて、ツールを活用しながら柔軟に対応します。
+Claude Sonnet 4.5という最先端のLLMで駆動しています。
 日本で唯一のAWS AI Heroに認定された、みのるんというエンジニアが開発しています。
 
 ## 利用可能なツール
@@ -127,42 +124,25 @@ aws_docs_client = MCPClient(
     lambda: streamablehttp_client(url="https://knowledge-mcp.global.api.aws")
 )
 
-# セッション管理: session_id → (Agent, last_access_time)
-_agent_sessions: dict[str, tuple[Agent, float]] = {}
-
-
-def _cleanup_expired_sessions() -> None:
-    """TTLを超えたセッションを削除"""
-    now = time.time()
-    expired = [
-        sid for sid, (_, last_access) in _agent_sessions.items()
-        if now - last_access > SESSION_TTL_SECONDS
-    ]
-    for sid in expired:
-        del _agent_sessions[sid]
-
-
-def _create_model() -> BedrockModel:
-    return BedrockModel(model_id=MODEL_ID)
+# セッション管理: session_id → Agent
+# AgentCore Runtimeが同じruntimeSessionIdを同じコンテナにルーティングするため、
+# コンテナのアイドルタイムアウト（15分）で自動的にセッションが破棄される
+_agent_sessions: dict[str, Agent] = {}
 
 
 def _get_or_create_agent(session_id: str | None) -> Agent:
     """セッションIDに対応するAgentを取得または作成"""
-    _cleanup_expired_sessions()
-
     if session_id and session_id in _agent_sessions:
-        agent, _ = _agent_sessions[session_id]
-        _agent_sessions[session_id] = (agent, time.time())
-        return agent
+        return _agent_sessions[session_id]
 
     agent = Agent(
-        model=_create_model(),
+        model=BedrockModel(model_id=MODEL_ID),
         system_prompt=SYSTEM_PROMPT,
         tools=[current_time, web_search, rss, clear_memory, aws_docs_client],
     )
 
     if session_id:
-        _agent_sessions[session_id] = (agent, time.time())
+        _agent_sessions[session_id] = agent
 
     return agent
 

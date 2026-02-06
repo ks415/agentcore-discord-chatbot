@@ -127,13 +127,41 @@ Lambda の `architecture: ARM_64` と Code バンドリングの `platform: "lin
 
 CDK エントリーポイント（`bin/agentcore-line-chatbot.ts`）で `dotenv.config({ path: ".env.local" })` を呼ぶことで、`process.env` 経由で環境変数を CDK スタックに渡せる。手動での `export` が不要になる。
 
-### AgentCore の OTEL トレースには 3 点セットが必要
+### AgentCore の OTEL トレースには 4 点セットが必要
 
 1. `requirements.txt`: `strands-agents[otel]` + `aws-opentelemetry-distro`
 2. `Dockerfile`: `CMD ["opentelemetry-instrument", "python", "agent.py"]`
 3. CDK 環境変数: `AGENT_OBSERVABILITY_ENABLED=true` 他
+4. **import パス**: `from bedrock_agentcore import BedrockAgentCoreApp`（`from bedrock_agentcore.runtime import ...` は不可）
 
-3 つすべてが揃わないとトレースが出力されない。
+4 つすべてが揃わないとトレースが出力されない。
+
+### import パスの違いでトレースが出ない問題
+
+`from bedrock_agentcore.runtime import BedrockAgentCoreApp` を使うと、内部的には同じ `bedrock_agentcore/runtime/app.py` が動くにもかかわらず、GenAI Observability の Traces View にトレースが一切表示されない。`from bedrock_agentcore import BedrockAgentCoreApp`（公式ドキュメントと同じパス）に変更すると即座にトレースが出力される。
+
+OTel のログ・メトリクスは両方の import パスで正常に出力されるため、影響を受けるのはトレース（X-Ray スパン）のエクスポートのみ。原因は SDK のトップレベル `__init__.py` で行われる Observability 初期化フックに runtime サブモジュール経由だと乗らない（または条件付き）ためと推測される。
+
+### 環境変数は最小構成で十分
+
+CDK の `environmentVariables` に必要な OTEL 関連設定:
+
+```typescript
+AGENT_OBSERVABILITY_ENABLED: "true",
+OTEL_PYTHON_DISTRO: "aws_distro",
+OTEL_PYTHON_CONFIGURATOR: "aws_configurator",
+OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf",
+```
+
+以下は **不要**（AgentCore が自動設定する。手動で入れると逆に干渉する可能性あり）:
+- `OTEL_TRACES_EXPORTER` — 自動で `otlp` が設定される
+- `OTEL_EXPORTER_OTLP_ENDPOINT` — 自動で X-Ray の OTLP endpoint が設定される
+- `OTEL_RESOURCE_ATTRIBUTES` — 自動で `aws.service.type=gen_ai_agent` 等が付与される
+- `OTEL_LOG_LEVEL` — Python の ADOT では効果なし
+
+### otel-rt-logs の otelTraceSampled: false は正常
+
+otel-rt-logs に出力される `otelTraceSampled: false` は、ログイベントの W3C Trace Context フラグであり、トレースが出力されないことを意味しない。正常にトレースが出ているプロジェクトでも同じ値が出る。
 
 ---
 
