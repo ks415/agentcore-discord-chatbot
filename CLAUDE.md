@@ -75,3 +75,16 @@ AgentCore Runtime (Docker コンテナ)
 新しいツールを追加する場合、以下の2箇所を同時に変更すること:
 1. `agent/agent.py` — ツール関数を定義し、`_get_or_create_agent()` 内の `tools=` リストに追加。`SYSTEM_PROMPT` にもツールの説明と使い分けルールを追記
 2. `lambda/webhook.py` — `TOOL_STATUS_MAP` にツール名とLINE上で表示するステータスメッセージを追加（例: `"my_tool": "処理中です..."`)
+
+## ディレクトリ構成（主要ファイル）
+```
+bin/agentcore-line-chatbot.ts  # CDK アプリのエントリーポイント（dotenv 読み込み）
+lib/agentcore-line-chatbot-stack.ts  # CDK スタック定義（AgentCore Runtime + Lambda + API Gateway）
+agent/
+  agent.py          # Strands Agent 本体（ツール定義、セッション管理、SYSTEM_PROMPT）
+  Dockerfile        # AgentCore Runtime のコンテナイメージ
+  requirements.txt  # Python 依存（strands-agents, bedrock-agentcore, mcp 等）
+lambda/
+  webhook.py        # LINE Webhook ハンドラ（署名検証、SSE→LINE Push Message 変換）
+  requirements.txt  # Python 依存（line-bot-sdk）
+```
