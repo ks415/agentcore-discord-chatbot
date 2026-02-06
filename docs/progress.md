@@ -39,7 +39,6 @@ agentcore-line-chatbot/
 ```
 
 ### 参照すべきナレッジスキル
-- `/kb-kimi` - Kimi K2 Thinking の問題・ワークアラウンド（ツール名破損リトライ、`<think>`タグ、cache 非対応など）
 - `/kb-line` - LINE Bot 開発（Webhook、署名検証、Push Message、グループチャット）
 - `/kb-strands-agentcore` - Strands Agents + Bedrock AgentCore（エージェント開発、CDK）
 
@@ -59,44 +58,6 @@ npx cdk deploy --hotswap --profile sandbox  # エージェントのみ高速デ�
 - Lambda ARM64 + バンドリング `platform: "linux/arm64"` は必ず一致させる
 - AgentCore の SSE には 2 種類のイベントがある。dict（Bedrock Converse Stream 形式）のみ処理し、str（Strands 生イベント）は無視する
 - セッション管理: `reply_to`（user_id or group_id）を `runtimeSessionId` に使用 → 同じチャット画面なら同じコンテナにルーティング
-
----
-
-## 機能1: Kimi K2 Thinking モデル対応
-
-環境変数 `MODEL_ID` でモデルを切り替えられるようにする。
-
-### 変更ファイル
-- `agent/agent.py` - モデル切り替えロジック追加
-- `lib/agentcore-line-chatbot-stack.ts` - 環境変数 `MODEL_ID` を AgentCore Runtime に追加
-- `.env.example` - `MODEL_ID` を追記
-
-### 実装内容
-
-**agent/agent.py:**
-- 環境変数 `MODEL_ID` を読み取り（デフォルト: `us.anthropic.claude-sonnet-4-5-20250929-v1:0`）
-- Kimi K2（`moonshot.kimi-k2-thinking`）の場合は `cache_prompt` / `cache_tools` を指定しない
-- Kimi K2 特有の注意点:
-  - `<think>` タグがテキストに混入する → フィルタリング不要（SSE側で処理されるため、Agent側では対処不要）
-  - ツール名破損のリスクがある → ただしリトライはサーバーサイドで複雑になるため、まずはシンプルに実装
-
-```python
-MODEL_ID = os.environ.get("MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
-
-def _create_model():
-    if "kimi" in MODEL_ID:
-        return BedrockModel(model_id=MODEL_ID)
-    else:
-        return BedrockModel(model_id=MODEL_ID)
-```
-
-### CDK 変更
-```typescript
-environmentVariables: {
-    MODEL_ID: process.env.MODEL_ID || "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-    // ...
-},
-```
 
 ---
 
@@ -234,9 +195,8 @@ from strands_tools import rss
 ## 実装順序
 
 1. **機能3: LINE ローディングアニメーション**（Lambda のみの変更で簡単）
-2. **機能1: Kimi K2 モデル対応**（Agent + CDK の変更）
-3. **機能2: AWS ドキュメント検索**（Agent + Lambda の変更、リモート接続のため Dockerfile 変更不要）
-4. **機能4: AWS What's New RSS フィード**（Agent + Lambda の変更）
+2. **機能2: AWS ドキュメント検索**（Agent + Lambda の変更、リモート接続のため Dockerfile 変更不要）
+3. **機能4: AWS What's New RSS フィード**（Agent + Lambda の変更）
 
 各機能の実装完了ごとにデプロイして動作確認する。
 
@@ -245,6 +205,5 @@ from strands_tools import rss
 | 機能 | ステータス |
 |------|-----------|
 | 機能3: LINE ローディングアニメーション | 完了 |
-| 機能1: Kimi K2 モデル対応 | 完了 |
 | 機能2: AWS ドキュメント検索（リモート MCP） | 完了 |
 | 機能4: AWS What's New RSS フィード | 完了 |

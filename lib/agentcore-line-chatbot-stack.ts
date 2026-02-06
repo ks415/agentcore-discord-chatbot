@@ -21,7 +21,6 @@ export class AgentcoreLineChatbotStack extends cdk.Stack {
       networkConfiguration:
         agentcore.RuntimeNetworkConfiguration.usingPublicNetwork(),
       environmentVariables: {
-        MODEL_ID: process.env.MODEL_ID || "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
         TAVILY_API_KEY: process.env.TAVILY_API_KEY || "",
         AGENT_OBSERVABILITY_ENABLED: "true",
         OTEL_PYTHON_DISTRO: "aws_distro",

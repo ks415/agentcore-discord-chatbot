@@ -26,7 +26,7 @@ AgentCore Runtime (Docker コンテナ)
   │  Strands Agent + BedrockModel
   │  ツール: current_time, web_search, rss, AWS Knowledge MCP
   ▼
-Bedrock LLM (Claude Sonnet 4.5 or Kimi K2 Thinking)
+Bedrock LLM (Claude Sonnet 4.5)
 ```
 
 ## コンポーネント詳細
@@ -78,7 +78,6 @@ LINE に依存しない汎用 AI エージェント。Docker コンテナとし�
 
 | 変数 | 用途 |
 |------|------|
-| MODEL_ID | 使用する LLM モデル ID |
 | TAVILY_API_KEY | Tavily Search API キー |
 | AGENT_OBSERVABILITY_ENABLED | OTEL トレース有効化 |
 
@@ -105,12 +104,7 @@ LINE に依存しない汎用 AI エージェント。Docker コンテナとし�
 
 ## LLM モデル
 
-環境変数 `MODEL_ID` で切り替え可能。
-
-| モデル | MODEL_ID | 備考 |
-|--------|----------|------|
-| Claude Sonnet 4.5（デフォルト）| `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | キャッシュ対応 |
-| Kimi K2 Thinking | `moonshot.kimi-k2-thinking` | キャッシュ非対応、思考プロセスあり |
+Claude Sonnet 4.5（`us.anthropic.claude-sonnet-4-5-20250929-v1:0`）を使用。
 
 ## セッション管理
 

@@ -92,18 +92,6 @@ Strands Agent は内部に会話履歴を保持する。セッション ID ご�
 
 ---
 
-## Kimi K2 Thinking
-
-### cache_prompt / cache_tools を指定してはいけない
-
-Kimi K2 で `BedrockModel` を作成する際、`cache_prompt` や `cache_tools` を指定すると `AccessDeniedException` が発生する。モデル ID に `"kimi"` が含まれる場合はこれらのオプションを省略すること。
-
-### クロスリージョン推論のプレフィックスがない
-
-Claude は `us.` や `jp.` のプレフィックスが付くが、Kimi K2 はプレフィックスなしの `moonshot.kimi-k2-thinking` をそのまま使用する。
-
----
-
 ## CDK / インフラ
 
 ### Lambda ARM64 とバンドリングの platform は一致させる
