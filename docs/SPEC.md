@@ -18,7 +18,7 @@ API Gateway (REST API)
   ▼
 Lambda (Python 3.13, ARM64)
   │  1. LINE 署名検証
-  │  2. ローディング表示（1対1: アニメーション / グループ: テキスト）
+  │  2. ローディング表示（1対1チャットのみアニメーション表示）
   │  3. AgentCore Runtime をストリーミング呼び出し
   │  4. SSE → LINE Push Message 変換
   ▼
@@ -70,7 +70,7 @@ LINE に依存しない汎用 AI エージェント。Docker コンテナとし�
 
 主な責務:
 - LLM（Bedrock）を使った対話
-- ツールの実行（ウェブ検索、AWS ドキュメント検索、RSS、時刻取得）
+- ツールの実行（ウェブ検索、AWS ドキュメント検索、RSS、時刻取得、記憶クリア）
 - セッション管理（会話履歴の保持）
 - SSE ストリーミングでのレスポンス返却
 
@@ -98,6 +98,7 @@ LINE に依存しない汎用 AI エージェント。Docker コンテナとし�
 | current_time | Strands 組み込み | 現在の UTC 時刻取得 |
 | web_search | カスタム（urllib） | Tavily API でウェブ検索 |
 | rss | Strands 組み込み | RSS フィード取得（AWS What's New 等） |
+| clear_memory | カスタム | 会話の記憶・履歴をクリア |
 | search_documentation | リモート MCP | AWS 公式ドキュメント検索 |
 | read_documentation | リモート MCP | AWS ドキュメントページ読み取り |
 | recommend | リモート MCP | 関連 AWS ドキュメント推奨 |
@@ -112,6 +113,7 @@ Claude Sonnet 4.5（`us.anthropic.claude-sonnet-4-5-20250929-v1:0`）を使用�
 - 同じチャット画面なら同じ AgentCore コンテナにルーティング
 - Agent インスタンスはメモリ内で管理（TTL: 15 分）
 - コンテナ再起動で会話履歴はリセット
+- ユーザーが「記憶を消して」等と送信すると `clear_memory` ツールでセッション削除
 
 ## LINE 対応仕様
 
@@ -120,20 +122,22 @@ Claude Sonnet 4.5（`us.anthropic.claude-sonnet-4-5-20250929-v1:0`）を使用�
 - メッセージ: そのまま処理
 
 ### グループチャット
-- ローディング: 「考えています...」テキスト送信（アニメーション API はグループ非対応）
+- ローディング: なし（通数節約のため。アニメーション API はグループ非対応）
 - メッセージ: Bot 宛メンション時のみ処理、`@Bot名` を除去してから Agent に渡す
 - 送信先: group_id / room_id 宛に Push Message
 
 ### SSE → Push Message 変換
 
-AgentCore Runtime の SSE ストリームを解析し、LINE Push Message に変換する。
+AgentCore Runtime の SSE ストリームを解析し、LINE Push Message に変換する。月間メッセージ上限を節約するため、テキストは最終ブロックのみ送信する。
 
 | SSE イベント | LINE での表現 |
 |-------------|--------------|
 | contentBlockDelta (text) | テキストバッファに蓄積 |
-| contentBlockStop | バッファを flush → Push Message 送信 |
-| contentBlockStart (toolUse) | ツール名に応じたステータスメッセージ送信 |
-| [DONE] | 処理完了 |
+| contentBlockStop | `last_text_block` に保持（送信しない） |
+| contentBlockStart (toolUse) | バッファ破棄 + ツール名に応じたステータスメッセージをリアルタイム送信 |
+| [DONE] | `last_text_block`（最終ブロック）を 1 通だけ Push Message で送信 |
+
+送信スロットリング: Push Message 間に最低 1 秒の間隔を確保（`throttled_send`）。
 
 AgentCore の SSE には 2 種類のイベントがある:
 - パターン A: Bedrock Converse Stream 形式（dict）→ これを使う
@@ -168,10 +172,12 @@ agentcore-line-chatbot/
 │   ├── requirements.txt               # strands-agents, mcp 等
 │   └── Dockerfile                     # uv + Python 3.13 + OpenTelemetry
 ├── docs/
-│   ├── PLAN.md                        # 初期実装計画
+│   ├── plan.md                        # 初期実装計画
 │   ├── progress.md                    # 実装進捗
-│   ├── SPEC.md                        # 設計・仕様書（この文書）
-│   └── KNOWLEDGE.md                   # 実装で得た学び
+│   ├── spec.md                        # 設計・仕様書（この文書）
+│   ├── knowledge.md                   # 実装で得た学び
+│   ├── deploy.md                      # デプロイ手順
+│   └── images/                        # アーキテクチャ図・スクリーンショット
 ├── .env.example                       # 環境変数テンプレート
 ├── .env.local                         # 実際の環境変数（Git 除外）
 ├── CLAUDE.md                          # Claude Code 向けプロジェクト説明

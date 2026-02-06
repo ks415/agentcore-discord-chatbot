@@ -23,7 +23,7 @@ LINE 署名検証には Webhook のリクエストボディをそのまま（raw
 公式ドキュメント:
 > "You can't specify group chats or multi-person chats."
 
-グループチャットでは従来通りテキストメッセージ（「考えています...」）で代替する。
+グループチャットではローディング表示を省略している（通数節約のため、テキスト送信も行わない）。
 
 ### グループチャットのメンション除去
 
@@ -32,6 +32,22 @@ LINE 署名検証には Webhook のリクエストボディをそのまま（raw
 ### テキスト上限は 5000 文字
 
 LINE Push Message のテキスト上限は 5000 文字。AI の回答が長くなる可能性があるため、`text.strip()[:5000]` で切り詰める。
+
+### 429 エラーの正体は月間メッセージ上限
+
+SSE ストリーミングで `contentBlockStop` ごとに Push Message を送ると、1 回の対話で多数のメッセージを消費する。無料プラン（コミュニケーションプラン）は月 200 通が上限で、超過すると 429 エラー（`"You have reached your monthly limit."`）が返る。
+
+レート制限（2,000 req/s）とは別の制限であり、送信頻度ではなく **通数の総量** が問題。対策はメッセージ通数自体を減らすこと。
+
+### Push Message のレート制限仕様
+
+| エンドポイント | レート制限 |
+|---|---|
+| Push Message | 2,000 req/s（チャネル単位） |
+| Loading Animation | 100 req/s |
+| Multicast | 200 req/s |
+
+レート制限はチャネル単位で適用される。429 レスポンスに `Retry-After` ヘッダーは含まれない。LINE 公式は 429 を「リトライすべきでない 4xx」に分類しており、リトライではなくスロットリング（頻度低減）が正しい対処。
 
 ---
 
@@ -86,6 +102,15 @@ Runtime を作成すると DEFAULT エンドポイントが自動作成される
 
 外部 REST API を呼ぶカスタムツール（Tavily 等）は Python 標準ライブラリの `urllib.request` で実装すれば追加パッケージ不要。Docker イメージのビルド時間短縮にも有効。
 
+### セッションクリアはツールとして実装
+
+AgentCore にはセッションを外部からクリアする API がない（`stop-runtime-session` は session_id が必要）。そのため `clear_memory` ツールを Agent に追加し、ユーザーが「記憶を消して」等と送るとLLMがツールを呼び出してセッションを削除する方式を採用。
+
+実装のポイント:
+- グローバル変数 `_current_session_id` で現在のセッション ID をツールに渡す
+- ツール内で `agent.messages.clear()` + `_agent_sessions` から削除（`clear_history()` は存在しないので注意）
+- システムプロンプトに対応方針を記載し、LLM に自然言語でツール呼び出しを判断させる
+
 ### セッション管理は Agent インスタンスの再利用で実現
 
 Strands Agent は内部に会話履歴を保持する。セッション ID ごとに Agent インスタンスを辞書で管理し、同じセッション ID なら同じ Agent を返すことで会話の継続性を実現。TTL を設けてメモリリークを防止する。
@@ -123,10 +148,18 @@ Lambda（webhook.py）は LINE 固有の処理（署名検証、Push Message 送
 - LINE SDK の依存を Lambda 側に閉じ込められる
 - Agent のテスト・開発が LINE 環境なしで可能
 
-### SSE のテキストバッファリング
+### SSE → Push Message 変換方式
 
-AI の回答は小さなチャンク（1〜数文字）で届く。これをそのまま Push Message にすると大量のメッセージが送られてしまう。`contentBlockDelta` でバッファに蓄積し、`contentBlockStop` でまとめて送信することで、自然な粒度のメッセージになる。
+AI の回答は小さなチャンク（1〜数文字）で届く。現在の方式:
+- `contentBlockDelta` でテキストをバッファに蓄積
+- `contentBlockStop` でバッファを flush → Push Message 送信
+- ツール開始時もバッファを flush してからステータスメッセージを送信
+- 送信間隔は最低 1 秒（`throttled_send`）で 429 エラーを防止
 
 ### ツール使用時のステータスメッセージ
 
-ツール実行中は数秒〜数十秒の無応答時間が生じる。`contentBlockStart(toolUse)` を検出して日本語のステータスメッセージ（「ウェブ検索しています...」等）を送ることで、ユーザーに処理状況を伝える。
+ツール実行中は数秒〜数十秒の無応答時間が生じる。`contentBlockStart(toolUse)` を検出して日本語のステータスメッセージ（「ウェブ検索しています...」等）を送ることで、ユーザーに処理状況を伝える。これはリアルタイムで送信する（最終ブロック方式の例外）。
+
+### 送信スロットリング
+
+LINE API の 429 エラーを防ぐため、Push Message 送信に最低 1 秒の間隔を設けている（`throttled_send`）。ツールステータスが連続する場合の安全策。Lambda の実行時間は `time.sleep` 分だけ伸びるが、非同期呼び出しのため LINE のレスポンスには影響しない。

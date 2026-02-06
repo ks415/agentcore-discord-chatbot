@@ -44,11 +44,11 @@ LINE User
   → API Gateway (REST, VTL で raw body + signature を抽出)
     → Lambda 非同期呼び出し (X-Amz-Invocation-Type: Event)
       → LINE 署名検証 → AgentCore Runtime SSE 呼び出し
-        → SSE イベントを LINE Push Message に変換して逐次送信
+        → ツール実行状況はリアルタイム通知、テキストは最終ブロックのみ Push Message で送信
 
 AgentCore Runtime (Docker コンテナ)
   → Strands Agent (セッション管理: reply_to を session_id に使用、15分 TTL)
-    → Tools: current_time, web_search(Tavily), rss, AWS Knowledge MCP Server
+    → Tools: current_time, web_search(Tavily), rss, clear_memory, AWS Knowledge MCP Server
 ```
 
 **Lambda (`lambda/webhook.py`)** — LINE Webhook の受付と SSE→LINE 変換のブリッジ。LINE SDK でローディングアニメーション表示、Push Message 送信、グループチャット対応（メンション検出・除去）を担当。

@@ -115,8 +115,8 @@ agentcore-line-chatbot/
 │   ├── agent.py                         # Strands Agent（web_search + current_time）
 │   ├── requirements.txt                 # strands-agents 等
 │   └── Dockerfile                       # uv + Python 3.13 + OpenTelemetry
-├── doc/
-│   └── PLAN.md                          # この実装計画
+├── docs/
+│   └── plan.md                          # この実装計画
 ├── .env.example                         # 環境変数テンプレート
 ├── .env.local                           # 実際の環境変数（Git 除外）
 ├── .gitignore

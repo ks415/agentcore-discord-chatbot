@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import time
 
 import boto3
 from linebot.v3 import WebhookParser
@@ -34,6 +35,7 @@ TOOL_STATUS_MAP = {
     "read_documentation": "AWSドキュメントを読んでいます...",
     "recommend": "関連ドキュメントを探しています...",
     "rss": "AWS What's New RSSを取得しています...",
+    "clear_memory": "会話の記憶をクリアしています...",
 }
 
 
@@ -71,15 +73,23 @@ def process_sse_stream(reply_to: str, response) -> None:
       例: {"event": {"contentBlockDelta": {"delta": {"text": "こ"}}}}
     - パターンB: Strands Agent生イベントのPython repr (JSON文字列) → 無視する
       例: "{'data': 'こ', 'agent': <Agent object>...}"
+
+    LINE月間メッセージ上限を節約するため、テキストは最終ブロックのみ送信する。
+    ツール実行ステータスだけリアルタイムで通知する。
     """
     text_buffer = ""
+    last_text_block = ""
+    last_send_time = 0.0
+    MIN_SEND_INTERVAL = 1.0  # 最低送信間隔（秒）
 
-    def flush_text_buffer():
-        nonlocal text_buffer
-        if text_buffer.strip():
-            # LINE Push Messageのテキスト上限は5000文字
-            send_push_message(reply_to, text_buffer.strip()[:5000])
-            text_buffer = ""
+    def throttled_send(text: str) -> None:
+        """レート制限を回避するため、最低間隔を空けてからPush Messageを送信する"""
+        nonlocal last_send_time
+        elapsed = time.time() - last_send_time
+        if elapsed < MIN_SEND_INTERVAL:
+            time.sleep(MIN_SEND_INTERVAL - elapsed)
+        send_push_message(reply_to, text)
+        last_send_time = time.time()
 
     try:
         for line in response["response"].iter_lines(chunk_size=64):
@@ -120,21 +130,24 @@ def process_sse_stream(reply_to: str, response) -> None:
                     text_buffer += text
                 continue
 
-            # ツール使用開始: {"event": {"contentBlockStart": {"start": {"toolUse": {"name": "..."}}}}}
+            # ツール使用開始: ステータスメッセージをリアルタイム送信
             content_block_start = inner_event.get("contentBlockStart")
             if content_block_start:
                 start = content_block_start.get("start", {})
                 tool_use = start.get("toolUse", {})
                 if tool_use:
-                    flush_text_buffer()
+                    # ツール前のテキストは途中応答なので捨てる
+                    text_buffer = ""
                     tool_name = tool_use.get("name", "unknown")
                     status_text = TOOL_STATUS_MAP.get(tool_name, f"{tool_name} を実行しています...")
-                    send_push_message(reply_to, status_text)
+                    throttled_send(status_text)
                 continue
 
-            # コンテンツブロック終了: テキストが溜まっていればflush
+            # コンテンツブロック終了: テキストを最終ブロック候補として保持（送信はしない）
             if "contentBlockStop" in inner_event:
-                flush_text_buffer()
+                if text_buffer.strip():
+                    last_text_block = text_buffer.strip()
+                text_buffer = ""
                 continue
 
     except Exception as e:
@@ -144,8 +157,9 @@ def process_sse_stream(reply_to: str, response) -> None:
     finally:
         response["response"].close()
 
-    # 残りのバッファをflush
-    flush_text_buffer()
+    # 最終テキストブロックのみ送信（5000文字上限）
+    if last_text_block:
+        send_push_message(reply_to, last_text_block[:5000])
 
 
 def _is_bot_mentioned(message: TextMessageContent) -> bool:
@@ -218,10 +232,8 @@ def handler(event, context):
         if not user_message:
             continue
 
-        # ローディング表示: 1対1チャットはアニメーション、グループチャットはテキスト
-        if is_group_chat:
-            send_push_message(reply_to, "考えています...")
-        else:
+        # ローディング表示（1対1チャットのみ、通数節約のためテキスト送信はしない）
+        if not is_group_chat:
             show_loading(source.user_id)
 
         # AgentCore Runtime をストリーミングで呼び出し

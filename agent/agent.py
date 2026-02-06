@@ -19,6 +19,24 @@ MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 
 SESSION_TTL_SECONDS = 15 * 60  # 15分
 
+# 現在処理中のセッションID（ツールからセッション操作するために使用）
+_current_session_id: str | None = None
+
+
+@tool
+def clear_memory() -> str:
+    """会話の記憶・履歴をクリアします。ユーザーが「記憶を消して」「履歴をリセット」「忘れて」「会話をクリア」など、会話履歴の削除を求めた場合に使います。
+
+    Returns:
+        クリア結果のメッセージ
+    """
+    if _current_session_id and _current_session_id in _agent_sessions:
+        agent, _ = _agent_sessions[_current_session_id]
+        agent.messages.clear()
+        del _agent_sessions[_current_session_id]
+        logger.info(f"Session cleared by tool: {_current_session_id}")
+    return "会話の記憶をクリアしました。"
+
 
 @tool
 def web_search(query: str) -> str:
@@ -75,6 +93,7 @@ SYSTEM_PROMPT = """あなたはLINEで動くアシスタント「みのるんAI�
 - read_documentation: AWSドキュメントのページを読み取り
 - rss: RSSフィードを取得（AWSの最新アップデート確認に使用。action="fetch", url="https://aws.amazon.com/jp/about-aws/whats-new/recent/feed/" で呼び出す）
 - current_time: 現在のUTC時刻を取得（JST = UTC+9 に変換して使用）
+- clear_memory: 会話の記憶・履歴をクリア
 
 ## 対応方針
 - AWSの最新アップデート、What's New、新機能について聞かれたら → rss ツールを使う
@@ -83,12 +102,13 @@ SYSTEM_PROMPT = """あなたはLINEで動くアシスタント「みのるんAI�
 - 日時や相対日付（"最新"なども）に関する質問 → current_time で現在時刻を確認
 - 一般的な質問や雑談 → 自分の知識で対応（必要に応じてweb_searchも活用）
 - 複数のツールを組み合わせて回答してもOK
+- 「記憶を消して」「忘れて」「リセット」「履歴クリア」など会話履歴の削除を求められたら → clear_memory を使う
 - 曖昧な依頼など、不明点があればユーザーに聞き返してください
 
 ## 応答ルール
 - 元気に明るく応対すること。絵文字は頻用しすぎないこと
 - 最終回答はスマホで読みやすいようコンパクトに
-- 1メッセージは200文字以内を目安にする
+- 1メッセージは200文字以内を目安にする。Web検索結果もうまく要約すること
 - 長文は避け、重要な情報のみを簡潔に伝える
 - Markdownは絶対に使わない（LINEではレンダリングされないため）
   - NG: **太字**、# 見出し、[リンク](URL)、```コードブロック```
@@ -138,7 +158,7 @@ def _get_or_create_agent(session_id: str | None) -> Agent:
     agent = Agent(
         model=_create_model(),
         system_prompt=SYSTEM_PROMPT,
-        tools=[current_time, web_search, rss, aws_docs_client],
+        tools=[current_time, web_search, rss, clear_memory, aws_docs_client],
     )
 
     if session_id:
@@ -149,8 +169,10 @@ def _get_or_create_agent(session_id: str | None) -> Agent:
 
 @app.entrypoint
 async def invoke_agent(payload, context):
+    global _current_session_id
     prompt = payload.get("prompt", "")
     session_id = payload.get("session_id")
+    _current_session_id = session_id
 
     agent = _get_or_create_agent(session_id)
 

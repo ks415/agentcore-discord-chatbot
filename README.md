@@ -25,7 +25,7 @@ LINE にメッセージを送ると、AI エージェントがウェブ検索や
 - Tavily API を使ったウェブ検索（ニュース、技術情報、一般知識など）
 - AWS Knowledge MCP Server によるAWSドキュメント検索・閲覧
 - AWS What's New の RSS フィード取得
-- SSE ストリーミングによるリアルタイム応答（ツール実行状況を LINE に逐次表示）
+- SSE ストリーミングによるリアルタイム応答（ツール実行状況を LINE に通知、最終回答を 1 通で送信）
 - 1対1チャット / グループチャット（メンション起動）の両対応
 - 会話履歴の保持（セッション管理、15分 TTL）
 - OpenTelemetry による可観測性
@@ -37,6 +37,7 @@ LINE にメッセージを送ると、AI エージェントがウェブ検索や
 | `web_search` | Tavily API によるウェブ検索 |
 | `current_time` | 現在の UTC 時刻を取得 |
 | `rss` | RSS フィード取得（AWS What's New など） |
+| `clear_memory` | 会話の記憶・履歴をクリア |
 | `search_documentation` | AWS 公式ドキュメント検索（MCP Server 経由） |
 | `read_documentation` | AWS ドキュメントのページ読み取り（MCP Server 経由） |
 

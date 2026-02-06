@@ -207,3 +207,4 @@ from strands_tools import rss
 | 機能3: LINE ローディングアニメーション | 完了 |
 | 機能2: AWS ドキュメント検索（リモート MCP） | 完了 |
 | 機能4: AWS What's New RSS フィード | 完了 |
+| 機能5: 会話記憶クリア（clear_memory ツール） | 完了 |
