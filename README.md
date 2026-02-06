@@ -7,7 +7,7 @@ LINE で動く AI チャットボットを、AWS Bedrock AgentCore + Strands Age
 LINE にメッセージを送ると、AI エージェントがウェブ検索や AWS ドキュメント検索などのツールを駆使して回答してくれます。
 ツール実行中の途中経過もリアルタイムに吹き出し表示されるので、待ち時間のストレスがありません。
 
-<img src="docs/images/sample.jpg" width="400">
+<img src="docs/images/sample1.jpg" width="300"> <img src="docs/images/sample2.jpg" width="300">
 
 ## システム構成
 
