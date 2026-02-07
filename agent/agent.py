@@ -4,10 +4,8 @@ import os
 import urllib.request
 
 from bedrock_agentcore import BedrockAgentCoreApp
-from mcp.client.streamable_http import streamablehttp_client
 from strands import Agent, tool
 from strands.models import BedrockModel
-from strands.tools.mcp import MCPClient
 from strands_tools import current_time, rss
 
 logger = logging.getLogger(__name__)
@@ -47,12 +45,14 @@ def web_search(query: str) -> str:
     """
     req = urllib.request.Request(
         "https://api.tavily.com/search",
-        data=json.dumps({
-            "query": query,
-            "max_results": 5,
-            "search_depth": "basic",
-            "include_answer": True,
-        }).encode("utf-8"),
+        data=json.dumps(
+            {
+                "query": query,
+                "max_results": 5,
+                "search_depth": "basic",
+                "include_answer": True,
+            }
+        ).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {TAVILY_API_KEY}",
             "Content-Type": "application/json",
@@ -79,22 +79,18 @@ def web_search(query: str) -> str:
     return "\n\n".join(parts) if parts else "検索結果が見つかりませんでした。"
 
 
-SYSTEM_PROMPT = """あなたはLINEで動くアシスタント「みのるんAI」です。
+SYSTEM_PROMPT = """あなたはLINEで動くアシスタント「チベットスナギツネAI」です。
 ユーザーからの質問や依頼に応じて、ツールを活用しながら柔軟に対応します。
-Claude Sonnet 4.5という最先端のLLMで駆動しています。みのるんというエンジニアが開発しています。
 
 ## 利用可能なツール
 - web_search: ウェブ検索で最新情報を取得（ニュース、技術情報、一般知識など）
-- search_documentation: AWSの公式ドキュメントを検索
-- read_documentation: AWSドキュメントのページを読み取り
-- rss: RSSフィードを取得（AWSの最新アップデート確認に使用。action="fetch", url="https://aws.amazon.com/jp/about-aws/whats-new/recent/feed/" で呼び出す）
+- rss: RSSフィードを取得（ニュースやブログの更新チェックに使用）
 - current_time: 現在のUTC時刻を取得（JST = UTC+9 に変換して使用）
 - clear_memory: 会話の記憶・履歴をクリア
 
 ## 対応方針
-- AWSの最新アップデート、What's New、新機能について聞かれたら → rss ツールを使う
-- AWSサービスについての質問 → search_documentation + read_documentation で対応
 - 最新のニュースや調べ物 → web_search で対応
+- RSSで更新を確認したい → rss を使う（必要ならURLを聞く）
 - 日時や相対日付（"最新"なども）に関する質問 → current_time で現在時刻を確認
 - 一般的な質問や雑談 → 自分の知識で対応（必要に応じてweb_searchも活用）
 - 複数のツールを組み合わせて回答してもOK
@@ -107,8 +103,8 @@ Claude Sonnet 4.5という最先端のLLMで駆動しています。みのるん
 - 1メッセージは200文字以内を目安にする。Web検索結果もうまく要約すること
 - 長文は避け、重要な情報のみを簡潔に伝える
 - Markdownは絶対に使わない（LINEではレンダリングされないため）
-  - NG: **太字**、# 見出し、[リンク](URL)、```コードブロック```
-  - OK: 「・」で箇条書き、【】で強調、改行で区切り
+    - NG: **太字**、# 見出し、[リンク](URL)、```コードブロック```
+    - OK: 「・」で箇条書き、【】で強調、改行で区切り
 
 ## 注意
 - ウェブ検索結果を使う場合、出典URLは省略し、情報の要点だけ伝える
@@ -118,10 +114,6 @@ Claude Sonnet 4.5という最先端のLLMで駆動しています。みのるん
 
 app = BedrockAgentCoreApp()
 
-# AWS Knowledge MCP Server（認証不要のリモートMCPサーバー）
-aws_docs_client = MCPClient(
-    lambda: streamablehttp_client(url="https://knowledge-mcp.global.api.aws")
-)
 
 # セッション管理: session_id → Agent
 # AgentCore Runtimeが同じruntimeSessionIdを同じコンテナにルーティングするため、
@@ -137,7 +129,7 @@ def _get_or_create_agent(session_id: str | None) -> Agent:
     agent = Agent(
         model=BedrockModel(model_id=MODEL_ID),
         system_prompt=SYSTEM_PROMPT,
-        tools=[current_time, web_search, rss, clear_memory, aws_docs_client],
+        tools=[current_time, web_search, rss, clear_memory],
     )
 
     if session_id:
