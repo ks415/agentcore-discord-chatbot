@@ -31,10 +31,7 @@ agentcore_client = boto3.client("bedrock-agentcore", region_name="us-east-1")
 TOOL_STATUS_MAP = {
     "current_time": "現在時刻を確認しています...",
     "web_search": "ウェブ検索しています...",
-    "search_documentation": "AWSドキュメントを検索しています...",
-    "read_documentation": "AWSドキュメントを読んでいます...",
-    "recommend": "関連ドキュメントを探しています...",
-    "rss": "AWS What's New RSSを取得しています...",
+    "fetch_race_info": "レース情報を取得しています...",
     "clear_memory": "会話の記憶をクリアしました！",
 }
 
@@ -44,9 +41,7 @@ def show_loading(user_id: str) -> None:
     try:
         with ApiClient(line_config) as api_client:
             api = MessagingApi(api_client)
-            api.show_loading_animation(
-                ShowLoadingAnimationRequest(chat_id=user_id, loading_seconds=60)
-            )
+            api.show_loading_animation(ShowLoadingAnimationRequest(chat_id=user_id, loading_seconds=60))
     except Exception as e:
         logger.warning(f"Loading animation failed: {e}")
 
@@ -169,9 +164,7 @@ def _is_bot_mentioned(message: TextMessageContent) -> bool:
     """メッセージにBot自身へのメンションが含まれているかチェックする"""
     if not message.mention:
         return False
-    return any(
-        getattr(m, "is_self", False) for m in message.mention.mentionees
-    )
+    return any(getattr(m, "is_self", False) for m in message.mention.mentionees)
 
 
 def _strip_bot_mention(message: TextMessageContent) -> str:
@@ -186,7 +179,7 @@ def _strip_bot_mention(message: TextMessageContent) -> str:
         reverse=True,
     )
     for m in mentionees:
-        text = text[:m.index] + text[m.index + m.length :]
+        text = text[: m.index] + text[m.index + m.length :]
     return text.strip()
 
 
@@ -222,11 +215,7 @@ def handler(event, context):
                 continue
 
         # 送信先: グループならgroup_id/room_id、1対1ならuser_id
-        reply_to = (
-            getattr(source, "group_id", None)
-            or getattr(source, "room_id", None)
-            or source.user_id
-        )
+        reply_to = getattr(source, "group_id", None) or getattr(source, "room_id", None) or source.user_id
 
         # メッセージテキストからBot宛メンション文字列を除去
         user_message = _strip_bot_mention(message) if is_group_chat else message.text

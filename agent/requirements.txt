@@ -2,6 +2,6 @@ botocore
 bedrock-agentcore
 strands-agents
 strands-agents[otel]
-strands-agents-tools[rss]
+strands-agents-tools
 aws-opentelemetry-distro
 mcp
