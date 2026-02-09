@@ -195,7 +195,7 @@ def fetch_race_info(url: str) -> str:
         return f"ページ取得エラー: {type(e).__name__}: {e}"
 
 
-SYSTEM_PROMPT = """あなたはLINEで動くボートレース（競艇）専門AIアシスタント「チベットスナギツネAI」です。
+SYSTEM_PROMPT = """あなたはLINEで動くボートレース（競艇）専門AIアシスタント「競艇 AI Bot」です。
 競艇に関する質問、レース予想、選手分析、買い目の評価などに特化して対応します。
 
 ## 利用可能なツール

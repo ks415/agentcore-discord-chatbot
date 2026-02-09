@@ -1,6 +1,7 @@
 import * as path from "path";
 import * as cdk from "aws-cdk-lib";
 import * as apigateway from "aws-cdk-lib/aws-apigateway";
+import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as iam from "aws-cdk-lib/aws-iam";
@@ -122,7 +123,18 @@ export class AgentcoreLineChatbotStack extends cdk.Stack {
     });
 
     // ========================================
-    // Lambda (Scraper - 競艇日和スクレイピング)
+    // DynamoDB (予想・結果・累計収支)
+    // ========================================
+    const predictionTable = new dynamodb.Table(this, "PredictionTable", {
+      tableName: "BoatRacePredictions",
+      partitionKey: { name: "racer_no", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "date_type", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
+    // ========================================
+    // Lambda (Scraper - 予想＋収支管理)
     // ========================================
     const scraperFn = new lambda.Function(this, "ScraperFunction", {
       runtime: lambda.Runtime.PYTHON_3_13,
@@ -139,28 +151,65 @@ export class AgentcoreLineChatbotStack extends cdk.Stack {
           ],
         },
       }),
-      timeout: cdk.Duration.seconds(30),
-      memorySize: 128,
+      timeout: cdk.Duration.seconds(180),
+      memorySize: 512,
       environment: {
         LINE_CHANNEL_ACCESS_TOKEN: process.env.LINE_CHANNEL_ACCESS_TOKEN || "",
         LINE_NOTIFY_TO: process.env.LINE_NOTIFY_TO || "",
         RACER_NO: process.env.RACER_NO || "3941",
+        DYNAMODB_TABLE: predictionTable.tableName,
       },
-    });``
+    });
 
-    // EventBridge Rule: 毎日 JST 22:00 (= UTC 13:00) に実行
-    const scraperRule = new events.Rule(this, "ScraperScheduleRule", {
-      ruleName: "kyoteibiyori-scraper-daily",
+    // Scraper → DynamoDB 読み書き権限
+    predictionTable.grantReadWriteData(scraperFn);
+
+    // Scraper → Bedrock モデル呼び出し権限
+    scraperFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["bedrock:InvokeModel"],
+        resources: [
+          "arn:aws:bedrock:*::foundation-model/*",
+          "arn:aws:bedrock:*:*:inference-profile/*",
+        ],
+      }),
+    );
+
+    // EventBridge Rule: 毎朝 JST 8:00 (= UTC 23:00 前日) に予想生成
+    const morningRule = new events.Rule(this, "MorningScraperRule", {
+      ruleName: "boat-race-morning-prediction",
       schedule: events.Schedule.cron({
-        minute: "00",
+        minute: "0",
+        hour: "23",
+        day: "*",
+        month: "*",
+        year: "*",
+      }),
+      description: "毎日 JST 8:00 に出走予定取得＋AI予想生成",
+    });
+    morningRule.addTarget(
+      new targets.LambdaFunction(scraperFn, {
+        event: events.RuleTargetInput.fromObject({ mode: "morning" }),
+      }),
+    );
+
+    // EventBridge Rule: 毎晩 JST 22:00 (= UTC 13:00) に結果収集
+    const eveningRule = new events.Rule(this, "EveningScraperRule", {
+      ruleName: "boat-race-evening-result",
+      schedule: events.Schedule.cron({
+        minute: "0",
         hour: "13",
         day: "*",
         month: "*",
         year: "*",
       }),
-      description: "毎日 JST 22:00 に競艇日和スクレイピングを実行",
+      description: "毎日 JST 22:00 にレース結果収集＋収支計算",
     });
-    scraperRule.addTarget(new targets.LambdaFunction(scraperFn));
+    eveningRule.addTarget(
+      new targets.LambdaFunction(scraperFn, {
+        event: events.RuleTargetInput.fromObject({ mode: "evening" }),
+      }),
+    );
 
     // ========================================
     // Outputs
