@@ -2,89 +2,111 @@ import json
 import logging
 import os
 import time
+import urllib.request
 
 import boto3
-from linebot.v3 import WebhookParser
-from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.messaging import (
-    ApiClient,
-    Configuration,
-    MessagingApi,
-    PushMessageRequest,
-    ShowLoadingAnimationRequest,
-    TextMessage,
-)
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from nacl.signing import VerifyKey
+from nacl.exceptions import BadSignatureError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
-LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
+DISCORD_PUBLIC_KEY = os.environ["DISCORD_PUBLIC_KEY"]
+DISCORD_APPLICATION_ID = os.environ["DISCORD_APPLICATION_ID"]
 AGENTCORE_RUNTIME_ARN = os.environ["AGENTCORE_RUNTIME_ARN"]
 
-parser = WebhookParser(LINE_CHANNEL_SECRET)
-line_config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
-
 agentcore_client = boto3.client("bedrock-agentcore", region_name="us-east-1")
+lambda_client = boto3.client("lambda")
 
 TOOL_STATUS_MAP = {
-    "current_time": "現在時刻を確認しています...",
-    "web_search": "ウェブ検索しています...",
-    "fetch_race_info": "レース情報を取得しています...",
-    "clear_memory": "会話の記憶をクリアしました！",
+    "current_time": "⏰ 現在時刻を確認しています...",
+    "web_search": "🔍 ウェブ検索しています...",
+    "fetch_race_info": "🚤 レース情報を取得しています...",
+    "clear_memory": "🧹 会話の記憶をクリアしました！",
 }
 
 
-def show_loading(user_id: str) -> None:
-    """1対1チャットでLINE公式ローディングアニメーションを表示"""
+def verify_discord_signature(body: str, signature: str, timestamp: str) -> bool:
+    """Discord のリクエスト署名を Ed25519 で検証する"""
     try:
-        with ApiClient(line_config) as api_client:
-            api = MessagingApi(api_client)
-            api.show_loading_animation(ShowLoadingAnimationRequest(chat_id=user_id, loading_seconds=60))
+        verify_key = VerifyKey(bytes.fromhex(DISCORD_PUBLIC_KEY))
+        verify_key.verify(f"{timestamp}{body}".encode(), bytes.fromhex(signature))
+        return True
+    except (BadSignatureError, Exception) as e:
+        logger.warning(f"Signature verification failed: {e}")
+        return False
+
+
+def edit_original_message(interaction_token: str, content: str) -> None:
+    """Deferred response の元メッセージを編集する（最終応答やステータス表示に使用）"""
+    url = f"https://discord.com/api/v10/webhooks/{DISCORD_APPLICATION_ID}/{interaction_token}/messages/@original"
+
+    # Discord メッセージ上限は 2000 文字
+    if len(content) > 2000:
+        content = content[:1997] + "..."
+
+    data = json.dumps({"content": content}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "DiscordBot (https://github.com/agentcore-line-chatbot, 1.0)",
+        },
+        method="PATCH",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=10)
     except Exception as e:
-        logger.warning(f"Loading animation failed: {e}")
+        logger.error(f"Failed to edit message: {e}")
 
 
-def send_push_message(reply_to: str, text: str) -> None:
-    """LINE Push Messageを送信する（user_id または group_id を指定）"""
-    if not text.strip():
-        return
-    with ApiClient(line_config) as api_client:
-        api = MessagingApi(api_client)
-        api.push_message(
-            PushMessageRequest(
-                to=reply_to,
-                messages=[TextMessage(text=text.strip())],
-            )
-        )
+def send_followup_message(interaction_token: str, content: str) -> None:
+    """Discord のフォローアップメッセージを送信する"""
+    url = f"https://discord.com/api/v10/webhooks/{DISCORD_APPLICATION_ID}/{interaction_token}"
+
+    if len(content) > 2000:
+        content = content[:1997] + "..."
+
+    data = json.dumps({"content": content}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "DiscordBot (https://github.com/agentcore-line-chatbot, 1.0)",
+        },
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        logger.error(f"Failed to send followup: {e}")
 
 
-def process_sse_stream(reply_to: str, response) -> None:
-    """AgentCore RuntimeのSSEストリームを読み取り、LINE Push Messageに変換して送信する
+def process_sse_stream(interaction_token: str, response) -> None:
+    """AgentCore RuntimeのSSEストリームを読み取り、Discord メッセージに変換して送信する
 
     AgentCore Runtimeは2種類のSSEイベントを返す:
     - パターンA: Bedrock Converse Stream形式 (JSON辞書) → これを使う
-      例: {"event": {"contentBlockDelta": {"delta": {"text": "こ"}}}}
     - パターンB: Strands Agent生イベントのPython repr (JSON文字列) → 無視する
-      例: "{'data': 'こ', 'agent': <Agent object>...}"
 
-    LINE月間メッセージ上限を節約するため、テキストは最終ブロックのみ送信する。
-    ツール実行ステータスだけリアルタイムで通知する。
+    ツール実行ステータスは deferred message の編集でリアルタイム表示し、
+    最終テキストブロックのみ deferred message の編集で送信する。
     """
     text_buffer = ""
     last_text_block = ""
-    last_send_time = 0.0
-    MIN_SEND_INTERVAL = 1.0  # 最低送信間隔（秒）
+    last_edit_time = 0.0
+    MIN_EDIT_INTERVAL = 2.0  # Discord API レート制限を考慮した最低間隔（秒）
 
-    def throttled_send(text: str) -> None:
-        """レート制限を回避するため、最低間隔を空けてからPush Messageを送信する"""
-        nonlocal last_send_time
-        elapsed = time.time() - last_send_time
-        if elapsed < MIN_SEND_INTERVAL:
-            time.sleep(MIN_SEND_INTERVAL - elapsed)
-        send_push_message(reply_to, text)
-        last_send_time = time.time()
+    def throttled_edit(text: str) -> None:
+        """レート制限を回避するため、最低間隔を空けてからメッセージを編集する"""
+        nonlocal last_edit_time
+        elapsed = time.time() - last_edit_time
+        if elapsed < MIN_EDIT_INTERVAL:
+            time.sleep(MIN_EDIT_INTERVAL - elapsed)
+        edit_original_message(interaction_token, text)
+        last_edit_time = time.time()
 
     try:
         for line in response["response"].iter_lines(chunk_size=64):
@@ -106,17 +128,15 @@ def process_sse_stream(reply_to: str, response) -> None:
                 logger.warning(f"Failed to parse SSE data: {data_str[:200]}")
                 continue
 
-            # パターンB（文字列）は無視: パターンAに同じ情報が含まれている
+            # パターンB（文字列）は無視
             if not isinstance(event, dict):
                 continue
 
-            # Bedrock Converse Stream形式: {"event": {...}}
             inner_event = event.get("event")
             if not isinstance(inner_event, dict):
-                # ライフサイクルイベント (init_event_loop, start等) やmessageは無視
                 continue
 
-            # テキストチャンク: {"event": {"contentBlockDelta": {"delta": {"text": "..."}}}}
+            # テキストチャンク
             content_block_delta = inner_event.get("contentBlockDelta")
             if content_block_delta:
                 delta = content_block_delta.get("delta", {})
@@ -125,23 +145,22 @@ def process_sse_stream(reply_to: str, response) -> None:
                     text_buffer += text
                 continue
 
-            # ツール使用開始: ステータスメッセージをリアルタイム送信
+            # ツール使用開始: ステータスメッセージを deferred message に表示
             content_block_start = inner_event.get("contentBlockStart")
             if content_block_start:
                 start = content_block_start.get("start", {})
                 tool_use = start.get("toolUse", {})
                 if tool_use:
-                    # ツール前のテキストは途中応答なので捨てる
                     text_buffer = ""
                     tool_name = tool_use.get("name", "unknown")
                     status_text = next(
                         (msg for key, msg in TOOL_STATUS_MAP.items() if key in tool_name),
-                        f"{tool_name} を実行しています...",
+                        f"🔧 {tool_name} を実行しています...",
                     )
-                    throttled_send(status_text)
+                    throttled_edit(status_text)
                 continue
 
-            # コンテンツブロック終了: テキストを最終ブロック候補として保持（送信はしない）
+            # コンテンツブロック終了: テキストを最終ブロック候補として保持
             if "contentBlockStop" in inner_event:
                 if text_buffer.strip():
                     last_text_block = text_buffer.strip()
@@ -150,99 +169,115 @@ def process_sse_stream(reply_to: str, response) -> None:
 
     except Exception as e:
         logger.error(f"Error processing SSE stream: {e}")
-        send_push_message(reply_to, "エラーが発生しました。もう一度お試しください。")
+        edit_original_message(interaction_token, "❌ エラーが発生しました。もう一度お試しください。")
         return
     finally:
         response["response"].close()
 
-    # 最終テキストブロックのみ送信（5000文字上限）
+    # 最終テキストブロックを deferred message に反映（2000文字上限）
     if last_text_block:
-        send_push_message(reply_to, last_text_block[:5000])
+        edit_original_message(interaction_token, last_text_block[:2000])
 
 
-def _is_bot_mentioned(message: TextMessageContent) -> bool:
-    """メッセージにBot自身へのメンションが含まれているかチェックする"""
-    if not message.mention:
-        return False
-    return any(getattr(m, "is_self", False) for m in message.mention.mentionees)
+def process_interaction(event: dict) -> dict:
+    """非同期で自己呼び出しされ、AgentCore を呼び出して Discord に応答する"""
+    interaction = event["interaction"]
+    token = interaction["token"]
+    channel_id = interaction.get("channel_id", "")
 
+    # スラッシュコマンドのオプションからユーザーメッセージを取得
+    options = interaction.get("data", {}).get("options", [])
+    user_message = ""
+    for opt in options:
+        if opt["name"] == "question":
+            user_message = opt["value"]
+            break
 
-def _strip_bot_mention(message: TextMessageContent) -> str:
-    """メッセージテキストからBot宛メンション文字列（@Bot名）を除去する"""
-    text = message.text
-    if not message.mention:
-        return text.strip()
-    # index が大きい方から除去（位置ずれ防止）
-    mentionees = sorted(
-        (m for m in message.mention.mentionees if getattr(m, "is_self", False)),
-        key=lambda m: m.index,
-        reverse=True,
-    )
-    for m in mentionees:
-        text = text[: m.index] + text[m.index + m.length :]
-    return text.strip()
+    if not user_message:
+        edit_original_message(token, "質問を入力してください。")
+        return {"statusCode": 200}
+
+    # ユーザーID取得（guild内 or DM）
+    user_id = ""
+    if "member" in interaction:
+        user_id = interaction["member"]["user"]["id"]
+    elif "user" in interaction:
+        user_id = interaction["user"]["id"]
+
+    logger.info(f"User {user_id} (channel={channel_id}): {user_message}")
+
+    # セッションID: 同じチャンネルなら同じコンテナにルーティング
+    # AgentCore は runtimeSessionId に最低33文字を要求するためプレフィックスを付与
+    raw_session_id = channel_id or user_id
+    session_id = f"discord-session-{raw_session_id}"
+    payload = json.dumps({"prompt": user_message, "session_id": session_id})
+
+    try:
+        response = agentcore_client.invoke_agent_runtime(
+            agentRuntimeArn=AGENTCORE_RUNTIME_ARN,
+            runtimeSessionId=session_id,
+            payload=payload.encode("utf-8"),
+            qualifier="DEFAULT",
+        )
+        process_sse_stream(token, response)
+    except Exception as e:
+        logger.error(f"AgentCore invocation failed: {e}")
+        edit_original_message(token, "❌ エラーが発生しました。もう一度お試しください。")
+
+    return {"statusCode": 200}
 
 
 def handler(event, context):
-    """Lambda handler - API Gatewayから非同期で呼び出される"""
-    logger.info(f"Received event: {json.dumps(event)}")
+    """Lambda handler - API Gatewayから同期呼び出し or 自己非同期呼び出し"""
+    logger.info(f"Received event: {json.dumps(event)[:1000]}")
 
+    # 非同期自己呼び出し: AgentCore 処理モード
+    if event.get("source") == "async_process":
+        return process_interaction(event)
+
+    # 同期パス: API Gateway 経由の Discord インタラクション
     body_str = event.get("body", "")
-    signature = event.get("signature", "")
+    headers = event.get("headers", {})
 
-    # LINE署名検証
-    try:
-        events = parser.parse(body_str, signature)
-    except InvalidSignatureError:
-        logger.error("Invalid LINE signature")
-        return {"statusCode": 400, "body": "Invalid signature"}
+    # ヘッダーキーは小文字の場合もある
+    signature = headers.get("x-signature-ed25519", "") or headers.get("X-Signature-Ed25519", "")
+    timestamp = headers.get("x-signature-timestamp", "") or headers.get("X-Signature-Timestamp", "")
 
-    # テキストメッセージのみ処理
-    for line_event in events:
-        if not isinstance(line_event, MessageEvent):
-            continue
-        if not isinstance(line_event.message, TextMessageContent):
-            continue
+    # Discord 署名検証
+    if not verify_discord_signature(body_str, signature, timestamp):
+        logger.error("Invalid Discord signature")
+        return {"statusCode": 401, "body": "Invalid signature"}
 
-        source = line_event.source
-        message = line_event.message
-        is_group_chat = source.type in ("group", "room")
+    interaction = json.loads(body_str)
+    interaction_type = interaction.get("type")
 
-        # グループチャット: Bot宛メンションがある場合のみ処理
-        if is_group_chat:
-            if not _is_bot_mentioned(message):
-                logger.info("Skipping group message without bot mention")
-                continue
+    # PING (type 1) → PONG
+    if interaction_type == 1:
+        return {
+            "statusCode": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"type": 1}),
+        }
 
-        # 送信先: グループならgroup_id/room_id、1対1ならuser_id
-        reply_to = getattr(source, "group_id", None) or getattr(source, "room_id", None) or source.user_id
+    # APPLICATION_COMMAND (type 2) → Deferred + 非同期処理
+    if interaction_type == 2:
+        # 自身を非同期で呼び出して処理を開始
+        lambda_client.invoke(
+            FunctionName=os.environ["AWS_LAMBDA_FUNCTION_NAME"],
+            InvocationType="Event",
+            Payload=json.dumps(
+                {
+                    "source": "async_process",
+                    "interaction": interaction,
+                }
+            ),
+        )
+        # Deferred Channel Message With Source（「Botが考え中...」を表示）
+        return {
+            "statusCode": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"type": 5}),
+        }
 
-        # メッセージテキストからBot宛メンション文字列を除去
-        user_message = _strip_bot_mention(message) if is_group_chat else message.text
-        logger.info(f"User {source.user_id} (reply_to={reply_to}): {user_message}")
-
-        if not user_message:
-            continue
-
-        # ローディング表示（1対1チャットのみ、通数節約のためテキスト送信はしない）
-        if not is_group_chat:
-            show_loading(source.user_id)
-
-        # AgentCore Runtime をストリーミングで呼び出し
-        # reply_toをセッションIDに使用: 同じチャット画面なら同じコンテナにルーティング
-        session_id = reply_to
-        payload = json.dumps({"prompt": user_message, "session_id": session_id})
-
-        try:
-            response = agentcore_client.invoke_agent_runtime(
-                agentRuntimeArn=AGENTCORE_RUNTIME_ARN,
-                runtimeSessionId=session_id,
-                payload=payload.encode("utf-8"),
-                qualifier="DEFAULT",
-            )
-            process_sse_stream(reply_to, response)
-        except Exception as e:
-            logger.error(f"AgentCore invocation failed: {e}")
-            send_push_message(reply_to, "エラーが発生しました。もう一度お試しください。")
-
-    return {"statusCode": 200, "body": "OK"}
+    logger.warning(f"Unhandled interaction type: {interaction_type}")
+    return {"statusCode": 400, "body": "Unhandled interaction type"}

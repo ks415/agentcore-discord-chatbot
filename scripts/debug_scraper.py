@@ -11,7 +11,7 @@ import os
 import types
 
 
-# linebot をダミーモジュールとしてスタブし、ImportError を回避する
+# nacl をダミーモジュールとしてスタブし、ImportError を回避する
 def _install_stub(name):
     """ドット区切りの各レベルにダミーモジュールを挿入"""
     parts = name.split(".")
@@ -22,14 +22,15 @@ def _install_stub(name):
 
 
 for stub in [
-    "linebot",
-    "linebot.v3",
-    "linebot.v3.messaging",
+    "nacl",
+    "nacl.signing",
+    "nacl.exceptions",
 ]:
     _install_stub(stub)
 
-# ダミー属性 (scraper.py が from linebot.v3.messaging import ... するため)
-mod = sys.modules["linebot.v3.messaging"]
+# ダミー属性
+mod = sys.modules["nacl.signing"]
+mod2 = sys.modules["nacl.exceptions"]
 
 
 class _DummyClass:
@@ -37,8 +38,8 @@ class _DummyClass:
         pass
 
 
-for attr in ["ApiClient", "Configuration", "MessagingApi", "PushMessageRequest", "TextMessage"]:
-    setattr(mod, attr, _DummyClass)
+setattr(mod, "VerifyKey", _DummyClass)
+setattr(mod2, "BadSignatureError", Exception)
 
 
 # boto3 をダミーモジュールとしてスタブ
@@ -69,8 +70,7 @@ boto3_mod.client = lambda *a, **kw: _DummyClient()
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lambda"))
 
 # 環境変数のダミー（モジュール読み込み時に参照される）
-os.environ.setdefault("LINE_CHANNEL_ACCESS_TOKEN", "dummy")
-os.environ.setdefault("LINE_NOTIFY_TO", "dummy")
+os.environ.setdefault("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/dummy/dummy")
 os.environ.setdefault("DYNAMODB_TABLE", "dummy")
 
 from scraper import (

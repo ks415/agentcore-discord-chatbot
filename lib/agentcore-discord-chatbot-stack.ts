@@ -9,7 +9,7 @@ import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as agentcore from "@aws-cdk/aws-bedrock-agentcore-alpha";
 import { Construct } from "constructs";
 
-export class AgentcoreLineChatbotStack extends cdk.Stack {
+export class AgentcoreDiscordChatbotStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
@@ -67,8 +67,8 @@ export class AgentcoreLineChatbotStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(120),
       memorySize: 256,
       environment: {
-        LINE_CHANNEL_SECRET: process.env.LINE_CHANNEL_SECRET || "",
-        LINE_CHANNEL_ACCESS_TOKEN: process.env.LINE_CHANNEL_ACCESS_TOKEN || "",
+        DISCORD_PUBLIC_KEY: process.env.DISCORD_PUBLIC_KEY || "",
+        DISCORD_APPLICATION_ID: process.env.DISCORD_APPLICATION_ID || "",
         AGENTCORE_RUNTIME_ARN: runtime.agentRuntimeArn,
       },
     });
@@ -76,51 +76,28 @@ export class AgentcoreLineChatbotStack extends cdk.Stack {
     // Lambda → AgentCore 呼び出し権限
     runtime.grantInvokeRuntime(webhookFn);
 
+    // Lambda → 自分自身を非同期呼び出し（Discord deferred response 用）
+    webhookFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["lambda:InvokeFunction"],
+        resources: ["*"],
+      }),
+    );
+
     // ========================================
-    // API Gateway (REST API - 非同期 Lambda 呼び出し)
+    // API Gateway (REST API - Discord Interactions Endpoint)
     // ========================================
     const api = new apigateway.RestApi(this, "WebhookApi", {
-      restApiName: "agentcore-line-chatbot-webhook",
-      description: "LINE Webhook endpoint for AgentCore LINE Chatbot",
+      restApiName: "agentcore-discord-chatbot-webhook",
+      description:
+        "Discord Interactions endpoint for AgentCore Discord Chatbot",
     });
 
-    // API Gateway → Lambda 非同期呼び出し用ロール
-    const apiGatewayRole = new iam.Role(this, "ApiGatewayLambdaRole", {
-      assumedBy: new iam.ServicePrincipal("apigateway.amazonaws.com"),
-    });
-    webhookFn.grantInvoke(apiGatewayRole);
-
-    // Lambda 非同期呼び出し統合
-    const lambdaIntegration = new apigateway.AwsIntegration({
-      service: "lambda",
-      path: `2015-03-31/functions/${webhookFn.functionArn}/invocations`,
-      integrationHttpMethod: "POST",
-      options: {
-        credentialsRole: apiGatewayRole,
-        requestParameters: {
-          "integration.request.header.X-Amz-Invocation-Type": "'Event'",
-        },
-        requestTemplates: {
-          "application/json": `{
-  "body": "$util.escapeJavaScript($input.body)",
-  "signature": "$input.params('x-line-signature')"
-}`,
-        },
-        integrationResponses: [
-          {
-            statusCode: "200",
-            responseTemplates: {
-              "application/json": '{"message": "accepted"}',
-            },
-          },
-        ],
-      },
-    });
+    // Discord Interactions Endpoint: 同期 Lambda 統合（署名検証 + deferred response を Lambda が返す）
+    const lambdaIntegration = new apigateway.LambdaIntegration(webhookFn);
 
     const webhook = api.root.addResource("webhook");
-    webhook.addMethod("POST", lambdaIntegration, {
-      methodResponses: [{ statusCode: "200" }],
-    });
+    webhook.addMethod("POST", lambdaIntegration);
 
     // ========================================
     // DynamoDB (予想・結果・累計収支)
@@ -154,8 +131,7 @@ export class AgentcoreLineChatbotStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(180),
       memorySize: 512,
       environment: {
-        LINE_CHANNEL_ACCESS_TOKEN: process.env.LINE_CHANNEL_ACCESS_TOKEN || "",
-        LINE_NOTIFY_TO: process.env.LINE_NOTIFY_TO || "",
+        DISCORD_WEBHOOK_URL: process.env.DISCORD_WEBHOOK_URL || "",
         RACER_NO: process.env.RACER_NO || "3941",
         DYNAMODB_TABLE: predictionTable.tableName,
       },
@@ -216,7 +192,7 @@ export class AgentcoreLineChatbotStack extends cdk.Stack {
     // ========================================
     new cdk.CfnOutput(this, "WebhookUrl", {
       value: `${api.url}webhook`,
-      description: "LINE Webhook URL",
+      description: "Discord Interactions Endpoint URL",
     });
 
     new cdk.CfnOutput(this, "AgentRuntimeArn", {

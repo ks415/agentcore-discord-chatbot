@@ -1,2 +1,2 @@
-line-bot-sdk
+PyNaCl
 boto3

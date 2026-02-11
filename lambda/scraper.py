@@ -22,20 +22,12 @@ from decimal import Decimal
 from html.parser import HTMLParser
 
 import boto3
-from linebot.v3.messaging import (
-    ApiClient,
-    Configuration,
-    MessagingApi,
-    PushMessageRequest,
-    TextMessage,
-)
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # --- 環境変数 ---
-LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
-LINE_NOTIFY_TO = os.environ["LINE_NOTIFY_TO"]
+DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 RACER_NO = os.environ.get("RACER_NO", "3941")
 DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "BoatRacePredictions")
 
@@ -77,7 +69,6 @@ VENUE_CODE_MAP = {
 }
 
 # --- AWS クライアント ---
-line_config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 dynamodb = boto3.resource("dynamodb")
 db_table = dynamodb.Table(DYNAMODB_TABLE)
 bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
@@ -709,20 +700,30 @@ def build_evening_message(
 
 
 # =============================================
-# LINE 送信
+# Discord 送信
 # =============================================
-def send_push_message(to: str, text: str) -> None:
-    """LINE Push Messageを送信する"""
+def send_discord_message(text: str) -> None:
+    """Discord Webhook でメッセージを送信する（2000文字上限を自動分割）"""
     if not text.strip():
         return
-    with ApiClient(line_config) as api_client:
-        api = MessagingApi(api_client)
-        api.push_message(
-            PushMessageRequest(
-                to=to,
-                messages=[TextMessage(text=text.strip())],
-            )
+    text = text.strip()
+    # Discord メッセージ上限は 2000 文字。超える場合は分割送信
+    chunks = [text[i : i + 2000] for i in range(0, len(text), 2000)]
+    for chunk in chunks:
+        data = json.dumps({"content": chunk}).encode("utf-8")
+        req = urllib.request.Request(
+            DISCORD_WEBHOOK_URL,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "DiscordBot (https://github.com/agentcore-line-chatbot, 1.0)",
+            },
+            method="POST",
         )
+        try:
+            urllib.request.urlopen(req, timeout=10)
+        except Exception as e:
+            logger.error(f"Failed to send Discord message: {e}")
 
 
 # =============================================
@@ -743,14 +744,14 @@ def morning_handler(event, context):
     if not data["has_schedule"]:
         name = data["player_name"] or f"選手{RACER_NO}"
         msg = f"🌅 {name}（{RACER_NO}）\n\n本日出走予定はありません。"
-        send_push_message(LINE_NOTIFY_TO, msg)
+        send_discord_message(msg)
         return {"statusCode": 200, "body": msg}
 
     # 2. 会場コードを特定
     venue_name = extract_venue_name(data["race_title"])
     if not venue_name:
         msg = f"⚠️ 会場名を特定できませんでした\nrace_title: {data['race_title']}"
-        send_push_message(LINE_NOTIFY_TO, msg)
+        send_discord_message(msg)
         return {"statusCode": 200, "body": msg}
 
     jcd = VENUE_CODE_MAP[venue_name]
@@ -780,9 +781,9 @@ def morning_handler(event, context):
     # 5. DynamoDB に保存
     save_morning_prediction(today, data, venue_name, jcd, predictions)
 
-    # 6. LINE通知
+    # 6. Discord通知
     msg = build_morning_message(data, predictions)
-    send_push_message(LINE_NOTIFY_TO, msg)
+    send_discord_message(msg)
     logger.info("Morning handler completed successfully")
 
     return {"statusCode": 200, "body": msg}
@@ -797,7 +798,7 @@ def evening_handler(event, context):
     morning = get_morning_prediction(today)
     if not morning:
         msg = "🌙 本日の予想データがありません（出走なし）"
-        send_push_message(LINE_NOTIFY_TO, msg)
+        send_discord_message(msg)
         return {"statusCode": 200, "body": msg}
 
     jcd = morning["venue_code"]
@@ -854,9 +855,9 @@ def evening_handler(event, context):
     cumulative = update_cumulative(today, total_bet, total_return, daily_pnl)
     logger.info(f"Cumulative: {cumulative}")
 
-    # 5. LINE通知
+    # 5. Discord通知
     msg = build_evening_message(morning, results, total_bet, total_return, daily_pnl, cumulative)
-    send_push_message(LINE_NOTIFY_TO, msg)
+    send_discord_message(msg)
     logger.info("Evening handler completed successfully")
 
     return {"statusCode": 200, "body": msg}
@@ -878,8 +879,7 @@ def handler(event, context):
     except Exception as e:
         logger.error(f"Handler error (mode={mode}): {e}", exc_info=True)
         try:
-            send_push_message(
-                LINE_NOTIFY_TO,
+            send_discord_message(
                 f"⚠️ エラー発生（{mode}）\n{type(e).__name__}: {e}",
             )
         except Exception:
