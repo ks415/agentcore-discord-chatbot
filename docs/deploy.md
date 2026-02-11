@@ -80,7 +80,7 @@ CloudWatch Logs の Lambda ログから確認できる:
 ```bash
 # Lambda のログから直近のセッションIDを確認
 aws logs filter-log-events \
-  --log-group-name "/aws/lambda/AgentcoreLineChatbotStack-WebhookFunction*" \
+  --log-group-name "/aws/lambda/AgentcoreDiscordChatbotStack-WebhookFunction*" \
   --filter-pattern "reply_to=" \
   --start-time $(date -v-1H +%s000) \
   --region us-east-1 \
@@ -101,7 +101,7 @@ aws logs filter-log-events \
 デプロイ完了時にコンソールに出力される。LINE Developers コンソールの Webhook URL と一致しているか確認する。
 
 ```
-AgentcoreLineChatbotStack.WebhookUrl = https://xxxxxxxxxx.execute-api.us-east-1.amazonaws.com/prod/webhook
+AgentcoreDiscordChatbotStack.WebhookUrl = https://xxxxxxxxxx.execute-api.us-east-1.amazonaws.com/prod/webhook
 ```
 
 ### 動作確認

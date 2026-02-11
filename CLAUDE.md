@@ -3,15 +3,17 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## プロジェクト概要
-LINE Messaging API + Bedrock AgentCore で動く汎用 AI チャットボット。
-Strands Agents でウェブ検索（Tavily API）やAWSドキュメント検索ツールを備えた対話型アシスタント。
+
+Discord Bot + Bedrock AgentCore で動く競艇専門 AI チャットボット。
+Strands Agents でウェブ検索（Tavily API）やレース情報取得ツールを備えた対話型アシスタント。
 
 ## 技術スタック
+
 - IaC: AWS CDK (TypeScript) + `@aws-cdk/aws-bedrock-agentcore-alpha` L2 コンストラクト
 - Webhook: API Gateway (REST) + Lambda (Python 3.13, ARM64)
 - Agent: Strands Agents on Bedrock AgentCore Runtime (Docker コンテナ)
 - LLM: Claude Sonnet 4.5 (`us.anthropic.claude-sonnet-4-5-20250929-v1:0`)
-- 検索: Tavily Search API、AWS Knowledge MCP Server
+- 検索: Tavily Search API
 - Observability: OpenTelemetry (AgentCore 標準)
 
 ## 開発コマンド
@@ -40,51 +42,60 @@ npx cdk deploy --hotswap --profile sandbox
 
 ## アーキテクチャ
 
-リクエストフローは3段構成で、Agent は LINE に依存しない設計:
+リクエストフローは3段構成で、Agent は Discord に依存しない設計:
 
 ```
-LINE User
-  → API Gateway (REST, VTL で raw body + signature を抽出)
-    → Lambda 非同期呼び出し (X-Amz-Invocation-Type: Event)
-      → LINE 署名検証 → AgentCore Runtime SSE 呼び出し
-        → ツール実行状況はリアルタイム通知、テキストは最終ブロックのみ Push Message で送信
+Discord User (/ask コマンド)
+  → API Gateway (REST, Lambda プロキシ統合)
+    → Lambda 同期呼び出し（Discord 署名検証 + Deferred Response 返却）
+    → Lambda 自己非同期呼び出し（AgentCore SSE → Discord Message Edit）
+      → AgentCore Runtime SSE 呼び出し
+        → ツール実行状況は deferred message 編集でリアルタイム表示、最終テキストも同様
 
 AgentCore Runtime (Docker コンテナ)
-  → Strands Agent (セッション管理: reply_to を session_id に使用、15分 TTL)
-    → Tools: current_time, web_search(Tavily), rss, clear_memory, AWS Knowledge MCP Server
+  → Strands Agent (セッション管理: channel_id を session_id に使用、15分 TTL)
+    → Tools: current_time, web_search(Tavily), fetch_race_info, clear_memory
 ```
 
-**Lambda (`lambda/webhook.py`)** — LINE Webhook の受付と SSE→LINE 変換のブリッジ。LINE SDK でローディングアニメーション表示、Push Message 送信、グループチャット対応（メンション検出・除去）を担当。
+**Lambda (`lambda/webhook.py`)** — Discord Interactions Endpoint。Ed25519 署名検証、PING/PONG 応答、Deferred Response + 自己非同期呼び出しで AgentCore を呼び出し、Discord REST API でメッセージを編集。
 
 **Agent (`agent/agent.py`)** — `BedrockAgentCoreApp` のエントリーポイント。`Agent.stream_async()` でストリーミング応答を生成。セッション管理は `_agent_sessions` dict で Agent インスタンスをキャッシュ（15分 TTL）。
 
-**CDK (`lib/agentcore-line-chatbot-stack.ts`)** — AgentCore Runtime + Lambda + API Gateway を定義。Lambda は `grantInvokeRuntime` で AgentCore 呼び出し権限を付与。
+**CDK (`lib/agentcore-discord-chatbot-stack.ts`)** — AgentCore Runtime + Lambda + API Gateway を定義。Lambda は `grantInvokeRuntime` で AgentCore 呼び出し権限を付与。Lambda の自己呼び出し権限も付与（Deferred Response 用）。
 
 ## 設計上の注意点
-- API Gateway → Lambda は非同期呼び出し（`X-Amz-Invocation-Type: Event`）。LINE への応答は Lambda が Push Message で返す
-- VTL テンプレートで `$util.escapeJavaScript($input.body)` により raw body を保持（LINE 署名検証に必須）
+
+- Discord Interactions Endpoint は同期 Lambda プロキシ統合（3秒以内に Deferred Response を返す必要がある）
+- Lambda は自身を非同期で呼び出し（`InvocationType: Event`）、AgentCore の SSE 処理を行う
+- Discord REST API でメッセージ編集（`PATCH /webhooks/{app_id}/{token}/messages/@original`）により応答を表示
+- Discord メッセージ上限は 2000 文字。`webhook.py` で `[:2000]` にトランケートしている
 - Lambda の ARM64 アーキテクチャと bundling の `platform: "linux/arm64"` は必ず一致させること
 - AgentCore の SSE には2種類のイベントがある: Bedrock Converse Stream 形式（dict）のみ処理し、Strands 生イベント（str）は無視する
-- AWS Knowledge MCP Server (`https://knowledge-mcp.global.api.aws`) は認証不要。`MCPClient` + `streamablehttp_client` で接続し、Agent の tools に直接渡す
 - **BedrockAgentCoreApp の import は `from bedrock_agentcore import BedrockAgentCoreApp` を使うこと**。`from bedrock_agentcore.runtime import ...` だと GenAI Observability のトレースが出力されない
 - Agent の Docker コンテナは `opentelemetry-instrument python agent.py` で起動（`agent/Dockerfile` の CMD）。OTel の設定は CDK 側の環境変数で注入
-- LINE Push Message のテキスト上限は 5000 文字。`webhook.py` で `[:5000]` にトランケートしている
-- セッション管理は `reply_to`（user_id or group_id）を `runtimeSessionId` として使い、AgentCore が同じコンテナにルーティング。コンテナのアイドルタイムアウト（15分）で自動破棄
+- セッション管理は `channel_id` を `runtimeSessionId` として使い、AgentCore が同じコンテナにルーティング。コンテナのアイドルタイムアウト（15分）で自動破棄
 
 ## Agent にツールを追加する手順
+
 新しいツールを追加する場合、以下の2箇所を同時に変更すること:
+
 1. `agent/agent.py` — ツール関数を定義し、`_get_or_create_agent()` 内の `tools=` リストに追加。`SYSTEM_PROMPT` にもツールの説明と使い分けルールを追記
-2. `lambda/webhook.py` — `TOOL_STATUS_MAP` にツール名とLINE上で表示するステータスメッセージを追加（例: `"my_tool": "処理中です..."`)
+2. `lambda/webhook.py` — `TOOL_STATUS_MAP` にツール名と Discord 上で表示するステータスメッセージを追加（例: `"my_tool": "🔧 処理中です..."`)
 
 ## ディレクトリ構成（主要ファイル）
+
 ```
 bin/agentcore-line-chatbot.ts  # CDK アプリのエントリーポイント（dotenv 読み込み）
-lib/agentcore-line-chatbot-stack.ts  # CDK スタック定義（AgentCore Runtime + Lambda + API Gateway）
+lib/agentcore-discord-chatbot-stack.ts  # CDK スタック定義（AgentCore Runtime + Lambda + API Gateway）
 agent/
   agent.py          # Strands Agent 本体（ツール定義、セッション管理、SYSTEM_PROMPT）
   Dockerfile        # AgentCore Runtime のコンテナイメージ
   requirements.txt  # Python 依存（strands-agents, bedrock-agentcore, mcp 等）
 lambda/
-  webhook.py        # LINE Webhook ハンドラ（署名検証、SSE→LINE Push Message 変換）
-  requirements.txt  # Python 依存（line-bot-sdk）
+  webhook.py        # Discord Interactions ハンドラ（署名検証、Deferred Response、SSE→Discord Message Edit 変換）
+  scraper.py        # 朝夜の予想・収支管理 Lambda（Discord Webhook で通知）
+  requirements.txt  # Python 依存（PyNaCl, boto3）
+scripts/
+  register_commands.py  # Discord スラッシュコマンド登録スクリプト
+  debug_scraper.py      # 出走予定パースのデバッグ
 ```
