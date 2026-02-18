@@ -12,7 +12,7 @@ Strands Agents でウェブ検索（Tavily API）やレース情報取得ツー�
 - IaC: AWS CDK (TypeScript) + `@aws-cdk/aws-bedrock-agentcore-alpha` L2 コンストラクト
 - Webhook: API Gateway (REST) + Lambda (Python 3.13, ARM64)
 - Agent: Strands Agents on Bedrock AgentCore Runtime (Docker コンテナ)
-- LLM: Claude Sonnet 4.5 (`us.anthropic.claude-sonnet-4-5-20250929-v1:0`)
+- LLM: Claude Sonnet 4.6 (`us.anthropic.claude-sonnet-4-6`)
 - 検索: Tavily Search API
 - Observability: OpenTelemetry (AgentCore 標準)
 

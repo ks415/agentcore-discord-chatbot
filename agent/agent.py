@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
-MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+MODEL_ID = "us.anthropic.claude-sonnet-4-6"
 
 # 現在処理中のセッションID（ツールからセッション操作するために使用）
 _current_session_id: str | None = None

@@ -34,7 +34,7 @@ DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "BoatRacePredictions")
 # --- 定数 ---
 DAILY_BUDGET = 10000
 JST = timezone(timedelta(hours=9))
-MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+MODEL_ID = "us.anthropic.claude-sonnet-4-6"
 KYOTEIBIYORI_BASE = "https://kyoteibiyori.com/racer/racer_no"
 BOATRACE_BASE = "https://www.boatrace.jp/owpc/pc/race"
 _USER_AGENT = (

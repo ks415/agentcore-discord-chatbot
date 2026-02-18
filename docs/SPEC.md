@@ -108,7 +108,7 @@ Discord に依存しない汎用 AI エージェント。Docker コンテナと�
 
 ## LLM モデル
 
-Claude Sonnet 4.5（`us.anthropic.claude-sonnet-4-5-20250929-v1:0`）を使用。
+Claude Sonnet 4.6（`us.anthropic.claude-sonnet-4-6`）を使用。
 
 ## セッション管理
 
