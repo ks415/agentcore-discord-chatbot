@@ -6,6 +6,7 @@ import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as lambda from "aws-cdk-lib/aws-lambda";
+import * as scheduler from "aws-cdk-lib/aws-scheduler";
 import * as agentcore from "@aws-cdk/aws-bedrock-agentcore-alpha";
 import { Construct } from "constructs";
 
@@ -111,6 +112,27 @@ export class AgentcoreDiscordChatbotStack extends cdk.Stack {
     });
 
     // ========================================
+    // EventBridge Scheduler 用 IAM ロール
+    // (動的に作成される one-time schedule が Scraper Lambda を呼び出す)
+    // ========================================
+    const schedulerRole = new iam.Role(this, "SchedulerRole", {
+      roleName: "boat-race-scheduler-role",
+      assumedBy: new iam.ServicePrincipal("scheduler.amazonaws.com"),
+    });
+
+    // ========================================
+    // EventBridge Scheduler グループ
+    // (レースごとの one-time schedule をまとめる名前空間)
+    // ========================================
+    const schedulerGroup = new scheduler.CfnScheduleGroup(
+      this,
+      "SchedulerGroup",
+      {
+        name: "boat-race-schedules",
+      },
+    );
+
+    // ========================================
     // Lambda (Scraper - 予想＋収支管理)
     // ========================================
     const scraperFn = new lambda.Function(this, "ScraperFunction", {
@@ -134,8 +156,13 @@ export class AgentcoreDiscordChatbotStack extends cdk.Stack {
         DISCORD_WEBHOOK_URL: process.env.DISCORD_WEBHOOK_URL || "",
         RACER_NO: process.env.RACER_NO || "3941",
         DYNAMODB_TABLE: predictionTable.tableName,
+        SCHEDULER_ROLE_ARN: schedulerRole.roleArn,
+        SCHEDULER_GROUP_NAME: schedulerGroup.name!,
       },
     });
+
+    // SCRAPER_FUNCTION_ARN は Lambda 実行時に context.invoked_function_arn から取得
+    // （CDK で scraperFn.functionArn を自身の環境変数に設定すると CloudFormation の循環参照になるため）
 
     // Scraper → DynamoDB 読み書き権限
     predictionTable.grantReadWriteData(scraperFn);
@@ -150,10 +177,54 @@ export class AgentcoreDiscordChatbotStack extends cdk.Stack {
         ],
       }),
     );
+    // クロスリージョン推論プロファイル利用に必要な Marketplace 権限
+    scraperFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: [
+          "aws-marketplace:ViewSubscriptions",
+          "aws-marketplace:Subscribe",
+        ],
+        resources: ["*"],
+      }),
+    );
 
-    // EventBridge Rule: 毎朝 JST 8:00 (= UTC 23:00 前日) に予想生成
+    // Scraper → EventBridge Scheduler 操作権限
+    scraperFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: [
+          "scheduler:CreateSchedule",
+          "scheduler:DeleteSchedule",
+          "scheduler:GetSchedule",
+        ],
+        resources: [
+          `arn:aws:scheduler:${this.region}:${this.account}:schedule/boat-race-schedules/*`,
+        ],
+      }),
+    );
+
+    // Scraper → iam:PassRole (Scheduler 用ロールを渡す権限)
+    scraperFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["iam:PassRole"],
+        resources: [schedulerRole.roleArn],
+      }),
+    );
+
+    // Scheduler ロール → Scraper Lambda 呼び出し権限
+    // NOTE: scraperFn.functionArn を直接参照すると ScraperFunction ↔ SchedulerRole の
+    //       循環参照になるため、パターンで指定して依存を断つ
+    schedulerRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ["lambda:InvokeFunction"],
+        resources: [
+          `arn:aws:lambda:${this.region}:${this.account}:function:AgentcoreDiscordChatbot*`,
+        ],
+      }),
+    );
+
+    // EventBridge Rule: 毎朝 JST 8:00 (= UTC 23:00 前日) にスケジュール生成
     const morningRule = new events.Rule(this, "MorningScraperRule", {
-      ruleName: "boat-race-morning-prediction",
+      ruleName: "boat-race-morning-schedule",
       schedule: events.Schedule.cron({
         minute: "0",
         hour: "23",
@@ -161,29 +232,12 @@ export class AgentcoreDiscordChatbotStack extends cdk.Stack {
         month: "*",
         year: "*",
       }),
-      description: "毎日 JST 8:00 に出走予定取得＋AI予想生成",
+      description:
+        "毎日 JST 8:00 に出走予定取得＋レースごとの動的スケジュール作成",
     });
     morningRule.addTarget(
       new targets.LambdaFunction(scraperFn, {
-        event: events.RuleTargetInput.fromObject({ mode: "morning" }),
-      }),
-    );
-
-    // EventBridge Rule: 毎晩 JST 22:00 (= UTC 13:00) に結果収集
-    const eveningRule = new events.Rule(this, "EveningScraperRule", {
-      ruleName: "boat-race-evening-result",
-      schedule: events.Schedule.cron({
-        minute: "0",
-        hour: "13",
-        day: "*",
-        month: "*",
-        year: "*",
-      }),
-      description: "毎日 JST 22:00 にレース結果収集＋収支計算",
-    });
-    eveningRule.addTarget(
-      new targets.LambdaFunction(scraperFn, {
-        event: events.RuleTargetInput.fromObject({ mode: "evening" }),
+        event: events.RuleTargetInput.fromObject({ mode: "schedule" }),
       }),
     );
 

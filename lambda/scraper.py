@@ -1,14 +1,16 @@
 """
-競艇予想＋収支管理 Lambda
+競艇予想＋収支管理 Lambda（レース単位スケジューリング版）
 
-朝 (JST 8:00): kyoteibiyori.com で出走予定取得
-               → boatrace.jp で出走表取得
-               → Bedrock Claude で3連単予想＋資金配分生成
-               → DynamoDB 保存 → LINE Push 通知
-夜 (JST 22:00): DynamoDB から朝の予想読み出し
-               → boatrace.jp で結果一覧取得
-               → 的中判定＋収支計算
-               → DynamoDB 更新（日次・累計） → LINE Push 通知
+schedule  (JST 8:00): kyoteibiyori.com で出走予定取得
+                      → 出走情報を Discord 通知
+                      → レースごとに EventBridge Scheduler で pre_race / post_race を動的作成
+pre_race  (締切10分前): boatrace.jp で出走表・直前情報・オッズ取得
+                       → Bedrock Claude で3連単予想＋資金配分生成
+                       → DynamoDB 保存 → Discord 通知
+post_race (締切20分後): boatrace.jp で個別レース結果取得
+                       → 的中判定＋収支計算
+                       → DynamoDB 保存 → Discord 通知
+                       → 最終レースなら累計収支更新
 """
 
 import json
@@ -30,9 +32,14 @@ logger.setLevel(logging.INFO)
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 RACER_NO = os.environ.get("RACER_NO", "3941")
 DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "BoatRacePredictions")
+SCHEDULER_ROLE_ARN = os.environ.get("SCHEDULER_ROLE_ARN", "")
+SCHEDULER_GROUP_NAME = os.environ.get("SCHEDULER_GROUP_NAME", "boat-race-schedules")
+# SCRAPER_FUNCTION_ARN は handler() で context.invoked_function_arn から設定される
+# (CDK で自身の ARN を環境変数に入れると CloudFormation の循環参照になるため)
+SCRAPER_FUNCTION_ARN = ""
 
 # --- 定数 ---
-DAILY_BUDGET = 10000
+RACE_BUDGET = 5000  # 1レースあたりの予算（円）
 JST = timezone(timedelta(hours=9))
 MODEL_ID = "us.anthropic.claude-sonnet-4-6"
 KYOTEIBIYORI_BASE = "https://kyoteibiyori.com/racer/racer_no"
@@ -72,6 +79,7 @@ VENUE_CODE_MAP = {
 dynamodb = boto3.resource("dynamodb")
 db_table = dynamodb.Table(DYNAMODB_TABLE)
 bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
+scheduler_client = boto3.client("scheduler", region_name="us-east-1")
 
 
 # =============================================
@@ -292,7 +300,7 @@ class _HTMLTextExtractor(HTMLParser):
 
 
 # =============================================
-# HTML Parser — boatrace.jp 結果一覧ページ
+# HTML Parser — boatrace.jp 結果一覧ページ（後方互換）
 # =============================================
 class ResultListParser(HTMLParser):
     """boatrace.jp の resultlist ページから3連単結果と払戻金を抽出する。
@@ -384,6 +392,113 @@ class ResultListParser(HTMLParser):
 
 
 # =============================================
+# HTML Parser — boatrace.jp 個別レース結果ページ
+# =============================================
+class RaceResultParser(HTMLParser):
+    """boatrace.jp の raceresult ページから3連単結果と払戻金を抽出する。
+
+    対象URL: /owpc/pc/race/raceresult?rno={rno}&jcd={jcd}&hd={YYYYMMDD}
+
+    HTML構造:
+    払戻金セクション内の各 <tbody> が1つの勝式。
+    - <td class="is-boatColor1 ...">着順のボート番号</td>
+    - 3連単のセクションを探し、数字3つと払戻金を取得
+    - 3連単は class "is-boatColor1" のスパンで着順番号、
+      "is-payout1" のスパンで払戻金
+
+    実装方針: テーブルのテキストから「3連単」行を見つけ、
+    その行の数字と払戻金を抽出するシンプルなアプローチ。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._in_tbody = False
+        self._in_td = False
+        self._in_span = False
+        self._current_span_class = ""
+        self._tbody_texts: list[str] = []
+        self._found_trifecta = False
+
+        # 結果着順（着順テーブル）
+        self._in_result_table = False
+        self._result_numbers: list[str] = []
+        self._in_result_number_span = False
+
+        # 払戻テーブル
+        self._in_payout_table = False
+        self._payout_tbody_count = 0
+        self._current_bet_type = ""
+        self._in_number_span = False
+        self._in_payout_span = False
+        self._trifecta_numbers: list[str] = []
+        self._trifecta_payout: int | None = None
+
+        # 結果
+        self.trifecta: str = ""  # "X-Y-Z"
+        self.payout: int = 0
+
+    def handle_starttag(self, tag, attrs):
+        attr_dict = dict(attrs)
+        cls = attr_dict.get("class", "")
+
+        if tag == "tbody":
+            self._in_tbody = True
+            self._tbody_texts = []
+
+        if tag == "td":
+            self._in_td = True
+
+        if tag == "span" and self._in_tbody:
+            self._in_span = True
+            self._current_span_class = cls
+            if "numberSet1_number" in cls and not self._found_trifecta:
+                self._in_number_span = True
+            if "is-payout1" in cls and not self._found_trifecta:
+                self._in_payout_span = True
+
+    def handle_endtag(self, tag):
+        if tag == "td":
+            self._in_td = False
+        if tag == "span":
+            self._in_span = False
+            self._in_number_span = False
+            self._in_payout_span = False
+
+        if tag == "tbody" and self._in_tbody:
+            self._in_tbody = False
+            # tbody のテキストに「3連単」が含まれているか確認
+            tbody_text = " ".join(self._tbody_texts)
+            if "3連単" in tbody_text and len(self._trifecta_numbers) >= 3 and self._trifecta_payout is not None:
+                self.trifecta = "-".join(self._trifecta_numbers[:3])
+                self.payout = self._trifecta_payout
+                self._found_trifecta = True
+            elif "3連単" not in tbody_text:
+                # 3連単以外の tbody はリセット
+                self._trifecta_numbers = []
+                self._trifecta_payout = None
+
+    def handle_data(self, data):
+        text = data.strip()
+        if not text:
+            return
+
+        if self._in_tbody:
+            self._tbody_texts.append(text)
+
+        if self._in_number_span and not self._found_trifecta:
+            if text.isdigit():
+                self._trifecta_numbers.append(text)
+
+        if self._in_payout_span and not self._found_trifecta:
+            clean = re.sub(r"[¥￥\\,\s]", "", text)
+            if clean:
+                try:
+                    self._trifecta_payout = int(clean)
+                except ValueError:
+                    pass
+
+
+# =============================================
 # HTTP ユーティリティ
 # =============================================
 def fetch_page(url: str) -> str:
@@ -452,61 +567,136 @@ def parse_result_list(html: str) -> list[dict]:
     return parser.races
 
 
+def parse_race_result(html: str) -> dict:
+    """boatrace.jp個別レース結果HTMLをパースして3連単結果を返す"""
+    parser = RaceResultParser()
+    parser.feed(html)
+    return {
+        "trifecta": parser.trifecta,
+        "payout": parser.payout,
+    }
+
+
+def parse_deadline_time(deadline_str: str, today: str) -> datetime | None:
+    """締切時刻文字列 (例: "14:12") をJST datetimeに変換する。
+
+    kyoteibiyoriのrace_rowsの3列目は "14:12" のような締切時刻。
+    """
+    m = re.search(r"(\d{1,2}):(\d{2})", deadline_str)
+    if not m:
+        return None
+    hour, minute = int(m.group(1)), int(m.group(2))
+    year = int(today[:4])
+    month = int(today[4:6])
+    day = int(today[6:8])
+    return datetime(year, month, day, hour, minute, tzinfo=JST)
+
+
 # =============================================
-# Bedrock Claude 予想生成
+# EventBridge Scheduler 操作
+# =============================================
+def create_one_time_schedule(
+    schedule_name: str,
+    fire_at_utc: datetime,
+    payload: dict,
+) -> None:
+    """EventBridge Scheduler で one-time スケジュールを作成する。
+
+    完了後に自動削除される (ActionAfterCompletion: DELETE)。
+    """
+    # at() 式: at(yyyy-mm-ddThh:mm:ss)
+    schedule_expression = f"at({fire_at_utc.strftime('%Y-%m-%dT%H:%M:%S')})"
+
+    try:
+        scheduler_client.create_schedule(
+            Name=schedule_name,
+            GroupName=SCHEDULER_GROUP_NAME,
+            ScheduleExpression=schedule_expression,
+            ScheduleExpressionTimezone="UTC",
+            FlexibleTimeWindow={"Mode": "OFF"},
+            Target={
+                "Arn": SCRAPER_FUNCTION_ARN,
+                "RoleArn": SCHEDULER_ROLE_ARN,
+                "Input": json.dumps(payload),
+            },
+            ActionAfterCompletion="DELETE",
+        )
+        logger.info(f"Created schedule: {schedule_name} at {schedule_expression}")
+    except scheduler_client.exceptions.ConflictException:
+        # 既に存在する場合は更新
+        scheduler_client.update_schedule(
+            Name=schedule_name,
+            GroupName=SCHEDULER_GROUP_NAME,
+            ScheduleExpression=schedule_expression,
+            ScheduleExpressionTimezone="UTC",
+            FlexibleTimeWindow={"Mode": "OFF"},
+            Target={
+                "Arn": SCRAPER_FUNCTION_ARN,
+                "RoleArn": SCHEDULER_ROLE_ARN,
+                "Input": json.dumps(payload),
+            },
+            ActionAfterCompletion="DELETE",
+        )
+        logger.info(f"Updated existing schedule: {schedule_name} at {schedule_expression}")
+
+
+# =============================================
+# Bedrock Claude 予想生成（1レース単位）
 # =============================================
 def invoke_bedrock_prediction(
     player_name: str,
     venue_name: str,
     date: str,
-    schedule_rows: list[list[str]],
-    racelist_texts: list[str],
+    race_no: int,
+    course_info: str,
+    racelist_text: str,
+    beforeinfo_text: str,
+    odds_text: str,
 ) -> dict:
-    """Bedrock Claude に出走表データを送り3連単予想を生成する"""
-
-    schedule_info = ""
-    for row in schedule_rows:
-        if len(row) >= 3:
-            schedule_info += f"  {row[0]}: {row[1]}コース（締切 {row[2]}）\n"
-
-    racelist_combined = "\n\n".join(racelist_texts)
+    """Bedrock Claude に出走表・直前情報・オッズを送り1レース分の3連単予想を生成する"""
 
     prompt = f"""あなたは競艇（ボートレース）の予想AIです。
-以下の出走表データに基づいて、{player_name}が出走する各レースについて3連単の予想と資金配分を行ってください。
+以下の出走表・直前情報・オッズデータに基づいて、{race_no}Rの3連単予想と資金配分を行ってください。
 
 【条件】
 - 舟券の種類: 3連単のみ
-- 1日の予算: {DAILY_BUDGET:,}円
-- 各レースに対して3〜6点の買い目を推奨
-- 予算は全レースの合計が{DAILY_BUDGET:,}円になるよう配分（100円単位）
+- このレースの予算: {RACE_BUDGET:,}円
+- 3〜6点の買い目を推奨
+- 合計が{RACE_BUDGET:,}円になるよう配分（100円単位）
 - 自信度に応じて金額を傾斜配分する
+- オッズを考慮し、期待値の高い買い目を優先する
 
 【分析ポイント】
 - 1号艇のイン逃げが基本（1コース1着率は全国平均55%前後）
 - スタートタイミング（ST）が早い選手は有利
 - モーター2連率・展示タイムも判断材料
+- 直前情報の展示タイム・スタート展示を重視
 - {player_name}の枠番・コースを特に注目
+- {player_name}は {course_info}
 
-【{player_name}の出走スケジュール】
+【レース情報】
 会場: {venue_name}
 日付: {date}
-{schedule_info}
-【出走表データ】
-{racelist_combined}
+レース: {race_no}R
+
+【出走表】
+{racelist_text}
+
+【直前情報】
+{beforeinfo_text}
+
+【オッズ（3連単）】
+{odds_text}
 
 以下のJSON形式で回答してください。JSON以外のテキストは含めないでください:
 {{
-  "predictions": [
+  "race_no": {race_no},
+  "analysis": "簡潔な展開予想（50文字以内）",
+  "bets": [
     {{
-      "race_no": レース番号(整数),
-      "analysis": "簡潔な展開予想（50文字以内）",
-      "bets": [
-        {{
-          "combination": "X-Y-Z",
-          "amount": 金額(整数、100円単位),
-          "reasoning": "この買い目の根拠（30文字以内）"
-        }}
-      ]
+      "combination": "X-Y-Z",
+      "amount": 金額(整数、100円単位),
+      "reasoning": "この買い目の根拠（30文字以内）"
     }}
   ]
 }}"""
@@ -548,44 +738,80 @@ def _to_dynamodb_item(data: dict) -> dict:
     return json.loads(json.dumps(data), parse_float=Decimal)
 
 
-def save_morning_prediction(today: str, data: dict, venue_name: str, jcd: str, predictions: dict) -> None:
-    """朝の予想データをDynamoDBに保存する"""
+def save_schedule(today: str, data: dict, venue_name: str, jcd: str, races: list[dict]) -> None:
+    """朝のスケジュール情報をDynamoDBに保存する"""
     item = _to_dynamodb_item(
         {
             "racer_no": RACER_NO,
-            "date_type": f"{today}#morning",
+            "date_type": f"{today}#schedule",
             "date": today,
             "player_name": data["player_name"],
             "venue_name": venue_name,
             "venue_code": jcd,
             "race_title": data["race_title"],
-            "daily_budget": DAILY_BUDGET,
-            "predictions": predictions.get("predictions", []),
+            "races": races,  # [{race_no, course, deadline}, ...]
+            "total_races": len(races),
         }
     )
     db_table.put_item(Item=item)
 
 
-def get_morning_prediction(today: str) -> dict | None:
-    """DynamoDBから朝の予想データを読み出す"""
-    response = db_table.get_item(Key={"racer_no": RACER_NO, "date_type": f"{today}#morning"})
+def get_schedule(today: str) -> dict | None:
+    """DynamoDBからスケジュール情報を読み出す"""
+    response = db_table.get_item(Key={"racer_no": RACER_NO, "date_type": f"{today}#schedule"})
     return response.get("Item")
 
 
-def save_evening_result(today: str, results: list, total_bet: int, total_return: int, daily_pnl: int) -> None:
-    """夜の結果データをDynamoDBに保存する"""
+def save_prediction(today: str, race_no: int, prediction: dict, venue_name: str, jcd: str, player_name: str) -> None:
+    """レース予想をDynamoDBに保存する"""
     item = _to_dynamodb_item(
         {
             "racer_no": RACER_NO,
-            "date_type": f"{today}#evening",
+            "date_type": f"{today}#prediction#{race_no}",
             "date": today,
-            "results": results,
-            "total_bet": total_bet,
-            "total_return": total_return,
-            "daily_pnl": daily_pnl,
+            "race_no": race_no,
+            "venue_name": venue_name,
+            "venue_code": jcd,
+            "player_name": player_name,
+            "race_budget": RACE_BUDGET,
+            "prediction": prediction,
         }
     )
     db_table.put_item(Item=item)
+
+
+def get_prediction(today: str, race_no: int) -> dict | None:
+    """DynamoDBからレース予想を読み出す"""
+    response = db_table.get_item(Key={"racer_no": RACER_NO, "date_type": f"{today}#prediction#{race_no}"})
+    return response.get("Item")
+
+
+def save_result(today: str, race_no: int, results: list, total_bet: int, total_return: int, race_pnl: int) -> None:
+    """レース結果をDynamoDBに保存する"""
+    item = _to_dynamodb_item(
+        {
+            "racer_no": RACER_NO,
+            "date_type": f"{today}#result#{race_no}",
+            "date": today,
+            "race_no": race_no,
+            "results": results,
+            "total_bet": total_bet,
+            "total_return": total_return,
+            "race_pnl": race_pnl,
+        }
+    )
+    db_table.put_item(Item=item)
+
+
+def get_all_results_for_day(today: str, race_nos: list[int]) -> list[dict]:
+    """その日の全レース結果をDynamoDBから読み出す"""
+    results = []
+    for rno in race_nos:
+        response = db_table.get_item(Key={"racer_no": RACER_NO, "date_type": f"{today}#result#{rno}"})
+        item = response.get("Item")
+        if item:
+            results.append(item)
+    return results
 
 
 def update_cumulative(today: str, total_bet: int, total_return: int, daily_pnl: int) -> dict:
@@ -614,58 +840,76 @@ def update_cumulative(today: str, total_bet: int, total_return: int, daily_pnl: 
 
 
 # =============================================
-# LINE メッセージ組み立て
+# Discord メッセージ組み立て
 # =============================================
-def build_morning_message(data: dict, predictions: dict) -> str:
-    """朝の予想通知メッセージを組み立てる"""
+def build_schedule_message(data: dict, races: list[dict]) -> str:
+    """朝のスケジュール通知メッセージを組み立てる（予想なし、出走情報のみ）"""
     name = data["player_name"] or f"選手{RACER_NO}"
-    lines = [f"🌅 {name}（{RACER_NO}）本日の予想"]
+    lines = [f"🌅 {name}（{RACER_NO}）本日の出走予定"]
     if data["race_title"]:
         lines.append(f"📍 {data['race_title']}")
-    lines.append(f"💰 本日の予算: {DAILY_BUDGET:,}円")
+    lines.append(f"💰 1レースあたりの予算: {RACE_BUDGET:,}円（{len(races)}レース合計: {RACE_BUDGET * len(races):,}円）")
     lines.append("")
 
-    for row in data["race_rows"]:
-        if len(row) >= 3:
-            lines.append(f"  {row[0]} ｜ {row[1]}コース ｜ {row[2]}")
+    for race in races:
+        lines.append(f"  {race['race_no']}R ｜ {race['course']} ｜ 締切 {race['deadline']}")
 
     lines.append("")
-    lines.append("【AI予想（3連単）】")
+    lines.append("各レースの締切10分前にAI予想を配信します 🤖")
 
-    for pred in predictions.get("predictions", []):
-        rno = pred["race_no"]
-        analysis = pred.get("analysis", "")
+    return "\n".join(lines)
+
+
+def build_pre_race_message(
+    player_name: str, venue_name: str, race_no: int, prediction: dict, race_index: int, total_races: int
+) -> str:
+    """レース予想メッセージを組み立てる"""
+    name = player_name or f"選手{RACER_NO}"
+    lines = [f"🏁 {name}（{RACER_NO}）{race_no}R 予想 [{race_index}/{total_races}]"]
+    lines.append(f"📍 {venue_name}")
+    lines.append(f"💰 予算: {RACE_BUDGET:,}円")
+    lines.append("")
+
+    analysis = prediction.get("analysis", "")
+    if analysis:
+        lines.append(f"📊 展開予想: {analysis}")
         lines.append("")
-        lines.append(f"▶ {rno}R {analysis}")
-        for bet in pred.get("bets", []):
-            lines.append(f"  🎯 {bet['combination']}  {int(bet['amount']):,}円")
-            if bet.get("reasoning"):
-                lines.append(f"     └ {bet['reasoning']}")
 
-    total = sum(int(bet["amount"]) for pred in predictions.get("predictions", []) for bet in pred.get("bets", []))
+    lines.append("【AI予想（3連単）】")
+    for bet in prediction.get("bets", []):
+        lines.append(f"  🎯 {bet['combination']}  {int(bet['amount']):,}円")
+        if bet.get("reasoning"):
+            lines.append(f"     └ {bet['reasoning']}")
+
+    total = sum(int(bet["amount"]) for bet in prediction.get("bets", []))
     lines.append("")
     lines.append(f"📊 投資合計: {total:,}円")
 
     return "\n".join(lines)
 
 
-def build_evening_message(
-    morning: dict, results: list, total_bet: int, total_return: int, daily_pnl: int, cumulative: dict
+def build_post_race_message(
+    player_name: str,
+    venue_name: str,
+    race_no: int,
+    results: list,
+    total_bet: int,
+    total_return: int,
+    race_pnl: int,
+    race_index: int,
+    total_races: int,
+    daily_summary: dict | None = None,
 ) -> str:
-    """夜の結果通知メッセージを組み立てる"""
-    name = morning.get("player_name", f"選手{RACER_NO}")
-    venue = morning.get("venue_name", "")
-
-    lines = [f"🌙 {name}（{RACER_NO}）本日の結果"]
-    if venue:
-        lines.append(f"📍 {venue}")
+    """レース結果メッセージを組み立てる。最終レースなら日次まとめも含む。"""
+    name = player_name or f"選手{RACER_NO}"
+    lines = [f"📋 {name}（{RACER_NO}）{race_no}R 結果 [{race_index}/{total_races}]"]
+    lines.append(f"📍 {venue_name}")
     lines.append("")
 
-    current_race = None
+    actual_result = results[0]["actual_result"] if results else "不明"
+    lines.append(f"▶ {race_no}R 結果: {actual_result}")
+
     for r in results:
-        if r["race_no"] != current_race:
-            current_race = r["race_no"]
-            lines.append(f"▶ {r['race_no']}R 結果: {r['actual_result']}")
         mark = "✅" if r["hit"] else "❌"
         line = f"  {mark} {r['prediction']} → {int(r['bet_amount']):,}円"
         if r["hit"]:
@@ -673,28 +917,47 @@ def build_evening_message(
         lines.append(line)
 
     lines.append("")
-    pnl_sign = "+" if daily_pnl >= 0 else ""
+    pnl_sign = "+" if race_pnl >= 0 else ""
     hit_count = sum(1 for r in results if r["hit"])
-    lines.append("📊 本日の収支")
+    lines.append(f"📊 {race_no}R 収支")
     lines.append(f"  投資: {total_bet:,}円")
     lines.append(f"  回収: {total_return:,}円")
-    lines.append(f"  損益: {pnl_sign}{daily_pnl:,}円")
+    lines.append(f"  損益: {pnl_sign}{race_pnl:,}円")
     lines.append(f"  的中: {hit_count}/{len(results)}本")
 
-    cum_pnl = int(cumulative.get("cumulative_pnl", 0))
-    cum_bet = int(cumulative.get("total_bet", 0))
-    cum_return = int(cumulative.get("total_return", 0))
-    days = int(cumulative.get("days_count", 0))
-    cum_sign = "+" if cum_pnl >= 0 else ""
+    # 最終レースの場合、日次まとめ + 累計収支を追加
+    if daily_summary:
+        day_bet = daily_summary["total_bet"]
+        day_return = daily_summary["total_return"]
+        day_pnl = daily_summary["daily_pnl"]
+        day_pnl_sign = "+" if day_pnl >= 0 else ""
+        day_hits = daily_summary["hit_count"]
+        day_total_bets = daily_summary["total_bet_count"]
 
-    lines.append("")
-    lines.append(f"📈 累計収支（{days}日間）")
-    lines.append(f"  投資: {cum_bet:,}円")
-    lines.append(f"  回収: {cum_return:,}円")
-    lines.append(f"  損益: {cum_sign}{cum_pnl:,}円")
-    if cum_bet > 0:
-        roi = (cum_return / cum_bet) * 100
-        lines.append(f"  回収率: {roi:.1f}%")
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("📊 本日の最終収支")
+        lines.append(f"  投資: {day_bet:,}円")
+        lines.append(f"  回収: {day_return:,}円")
+        lines.append(f"  損益: {day_pnl_sign}{day_pnl:,}円")
+        lines.append(f"  的中: {day_hits}/{day_total_bets}本")
+
+        cumulative = daily_summary.get("cumulative")
+        if cumulative:
+            cum_pnl = int(cumulative.get("cumulative_pnl", 0))
+            cum_bet = int(cumulative.get("total_bet", 0))
+            cum_return = int(cumulative.get("total_return", 0))
+            days = int(cumulative.get("days_count", 0))
+            cum_sign = "+" if cum_pnl >= 0 else ""
+
+            lines.append("")
+            lines.append(f"📈 累計収支（{days}日間）")
+            lines.append(f"  投資: {cum_bet:,}円")
+            lines.append(f"  回収: {cum_return:,}円")
+            lines.append(f"  損益: {cum_sign}{cum_pnl:,}円")
+            if cum_bet > 0:
+                roi = (cum_return / cum_bet) * 100
+                lines.append(f"  回収率: {roi:.1f}%")
 
     return "\n".join(lines)
 
@@ -729,10 +992,10 @@ def send_discord_message(text: str) -> None:
 # =============================================
 # Lambda Handlers
 # =============================================
-def morning_handler(event, context):
-    """朝ハンドラ: 出走予定取得 → AI予想生成 → LINE通知"""
+def schedule_handler(event, context):
+    """スケジュールハンドラ: 出走予定取得 → 出走情報Discord通知 → 動的スケジュール作成"""
     today = datetime.now(JST).strftime("%Y%m%d")
-    logger.info(f"Morning handler: RACER_NO={RACER_NO}, date={today}")
+    logger.info(f"Schedule handler: RACER_NO={RACER_NO}, date={today}")
 
     # 1. 競艇日和から出走予定を取得
     html = fetch_racer_page(RACER_NO)
@@ -757,122 +1020,271 @@ def morning_handler(event, context):
     jcd = VENUE_CODE_MAP[venue_name]
     logger.info(f"Venue: {venue_name} (jcd={jcd})")
 
-    # 3. boatrace.jp から出走表を取得
-    racelist_texts = []
+    # 3. レース情報を整理
+    races = []
     for row in data["race_rows"]:
-        rno = row[0].replace("R", "")
-        url = f"{BOATRACE_BASE}/racelist?rno={rno}&jcd={jcd}&hd={today}"
-        logger.info(f"Fetching racelist: {url}")
-        text = fetch_and_extract_text(url)
-        racelist_texts.append(f"=== {rno}R ===\n{text}")
-        time.sleep(1)  # サーバー負荷軽減
+        if len(row) >= 3:
+            race_no_str = row[0].replace("R", "")
+            races.append(
+                {
+                    "race_no": int(race_no_str),
+                    "course": row[1],
+                    "deadline": row[2],
+                }
+            )
 
-    # 4. Bedrock Claude で予想を生成
-    logger.info("Invoking Bedrock for prediction...")
-    predictions = invoke_bedrock_prediction(
-        data["player_name"],
-        venue_name,
-        today,
-        data["race_rows"],
-        racelist_texts,
-    )
-    logger.info(f"Predictions: {json.dumps(predictions, ensure_ascii=False)[:500]}")
+    total_races = len(races)
+    logger.info(f"Found {total_races} races")
+
+    # 4. EventBridge Scheduler で各レースの pre_race / post_race スケジュールを作成
+    now_jst = datetime.now(JST)
+    schedules_created = 0
+
+    for idx, race in enumerate(races):
+        race_no = race["race_no"]
+        deadline_dt = parse_deadline_time(race["deadline"], today)
+        if not deadline_dt:
+            logger.warning(f"Could not parse deadline for race {race_no}: {race['deadline']}")
+            continue
+
+        race_index = idx + 1  # 1-based
+
+        # 共通ペイロード
+        base_payload = {
+            "race_no": race_no,
+            "jcd": jcd,
+            "venue_name": venue_name,
+            "date": today,
+            "player_name": data["player_name"],
+            "total_races": total_races,
+            "race_index": race_index,
+            "course_info": race["course"],
+        }
+
+        # pre_race: 締切10分前
+        pre_race_time = deadline_dt - timedelta(minutes=10)
+        if pre_race_time > now_jst:
+            pre_race_utc = pre_race_time.astimezone(timezone.utc)
+            create_one_time_schedule(
+                schedule_name=f"pre-race-{today}-{race_no}",
+                fire_at_utc=pre_race_utc,
+                payload={**base_payload, "mode": "pre_race"},
+            )
+            schedules_created += 1
+            logger.info(f"Scheduled pre_race for {race_no}R at {pre_race_time.strftime('%H:%M')} JST")
+        else:
+            logger.warning(f"Skipping pre_race for {race_no}R — time already passed ({pre_race_time.strftime('%H:%M')} JST)")
+
+        # post_race: 締切20分後
+        post_race_time = deadline_dt + timedelta(minutes=20)
+        if post_race_time > now_jst:
+            post_race_utc = post_race_time.astimezone(timezone.utc)
+            create_one_time_schedule(
+                schedule_name=f"post-race-{today}-{race_no}",
+                fire_at_utc=post_race_utc,
+                payload={**base_payload, "mode": "post_race"},
+            )
+            schedules_created += 1
+            logger.info(f"Scheduled post_race for {race_no}R at {post_race_time.strftime('%H:%M')} JST")
+        else:
+            logger.warning(f"Skipping post_race for {race_no}R — time already passed ({post_race_time.strftime('%H:%M')} JST)")
 
     # 5. DynamoDB に保存
-    save_morning_prediction(today, data, venue_name, jcd, predictions)
+    save_schedule(today, data, venue_name, jcd, races)
 
     # 6. Discord通知
-    msg = build_morning_message(data, predictions)
+    msg = build_schedule_message(data, races)
     send_discord_message(msg)
-    logger.info("Morning handler completed successfully")
+    logger.info(f"Schedule handler completed. {schedules_created} schedules created.")
 
     return {"statusCode": 200, "body": msg}
 
 
-def evening_handler(event, context):
-    """夜ハンドラ: 結果収集 → 的中判定 → 収支計算 → LINE通知"""
-    today = datetime.now(JST).strftime("%Y%m%d")
-    logger.info(f"Evening handler: RACER_NO={RACER_NO}, date={today}")
+def pre_race_handler(event, context):
+    """レース予想ハンドラ: 出走表・直前情報・オッズ取得 → AI予想生成 → Discord通知"""
+    race_no = event["race_no"]
+    jcd = event["jcd"]
+    venue_name = event["venue_name"]
+    date = event["date"]
+    player_name = event["player_name"]
+    total_races = event["total_races"]
+    race_index = event["race_index"]
+    course_info = event.get("course_info", "")
 
-    # 1. DynamoDB から朝の予想を読み出し
-    morning = get_morning_prediction(today)
-    if not morning:
-        msg = "🌙 本日の予想データがありません（出走なし）"
+    logger.info(f"Pre-race handler: race_no={race_no}, venue={venue_name}, date={date}")
+
+    # 1. boatrace.jp から3つのページを取得
+    # 出走表
+    racelist_url = f"{BOATRACE_BASE}/racelist?rno={race_no}&jcd={jcd}&hd={date}"
+    logger.info(f"Fetching racelist: {racelist_url}")
+    racelist_text = fetch_and_extract_text(racelist_url)
+    time.sleep(1)
+
+    # 直前情報
+    beforeinfo_url = f"{BOATRACE_BASE}/beforeinfo?rno={race_no}&jcd={jcd}&hd={date}"
+    logger.info(f"Fetching beforeinfo: {beforeinfo_url}")
+    beforeinfo_text = fetch_and_extract_text(beforeinfo_url)
+    time.sleep(1)
+
+    # オッズ（3連単）
+    odds_url = f"{BOATRACE_BASE}/oddstf?rno={race_no}&jcd={jcd}&hd={date}"
+    logger.info(f"Fetching odds: {odds_url}")
+    odds_text = fetch_and_extract_text(odds_url, max_length=8000)
+
+    # 2. Bedrock Claude で予想を生成
+    logger.info(f"Invoking Bedrock for prediction (race {race_no}R)...")
+    prediction = invoke_bedrock_prediction(
+        player_name=player_name,
+        venue_name=venue_name,
+        date=date,
+        race_no=race_no,
+        course_info=course_info,
+        racelist_text=racelist_text,
+        beforeinfo_text=beforeinfo_text,
+        odds_text=odds_text,
+    )
+    logger.info(f"Prediction: {json.dumps(prediction, ensure_ascii=False)[:500]}")
+
+    # 3. DynamoDB に保存
+    save_prediction(date, race_no, prediction, venue_name, jcd, player_name)
+
+    # 4. Discord通知
+    msg = build_pre_race_message(player_name, venue_name, race_no, prediction, race_index, total_races)
+    send_discord_message(msg)
+    logger.info(f"Pre-race handler completed for {race_no}R")
+
+    return {"statusCode": 200, "body": msg}
+
+
+def post_race_handler(event, context):
+    """レース結果ハンドラ: 結果取得 → 的中判定 → 収支計算 → Discord通知"""
+    race_no = event["race_no"]
+    jcd = event["jcd"]
+    venue_name = event["venue_name"]
+    date = event["date"]
+    player_name = event["player_name"]
+    total_races = event["total_races"]
+    race_index = event["race_index"]
+
+    logger.info(f"Post-race handler: race_no={race_no}, venue={venue_name}, date={date}")
+
+    # 1. DynamoDB から予想を読み出し
+    pred_item = get_prediction(date, race_no)
+    if not pred_item:
+        msg = f"⚠️ {race_no}R の予想データがありません"
         send_discord_message(msg)
         return {"statusCode": 200, "body": msg}
 
-    jcd = morning["venue_code"]
-    logger.info(f"Reading results for venue={morning['venue_name']} (jcd={jcd})")
+    prediction = pred_item["prediction"]
 
-    # 2. boatrace.jp から結果一覧を取得
-    url = f"{BOATRACE_BASE}/resultlist?jcd={jcd}&hd={today}"
-    logger.info(f"Fetching resultlist: {url}")
-    html = fetch_page(url)
-    race_results = parse_result_list(html)
-    result_map = {r["race_no"]: r for r in race_results}
-    logger.info(f"Parsed {len(race_results)} race results")
+    # 2. boatrace.jp から個別レース結果を取得
+    result_url = f"{BOATRACE_BASE}/raceresult?rno={race_no}&jcd={jcd}&hd={date}"
+    logger.info(f"Fetching raceresult: {result_url}")
+    html = fetch_page(result_url)
+    race_result = parse_race_result(html)
+    logger.info(f"Race result: trifecta={race_result['trifecta']}, payout={race_result['payout']}")
+
+    if not race_result["trifecta"]:
+        msg = f"⚠️ {race_no}R の結果を取得できませんでした（レース中止またはデータ未反映の可能性）"
+        send_discord_message(msg)
+        return {"statusCode": 200, "body": msg}
 
     # 3. 予想と結果を照合
     total_bet = 0
     total_return = 0
     results = []
 
-    for pred in morning.get("predictions", []):
-        race_no = int(pred["race_no"])
-        actual = result_map.get(race_no)
+    for bet in prediction.get("bets", []):
+        amount = int(bet["amount"])
+        total_bet += amount
 
-        for bet in pred.get("bets", []):
-            amount = int(bet["amount"])
-            total_bet += amount
+        hit = bet["combination"] == race_result["trifecta"]
+        return_amount = 0
+        if hit:
+            return_amount = (amount // 100) * race_result["payout"]
+            total_return += return_amount
 
-            hit = False
-            return_amount = 0
-            actual_trifecta = actual["trifecta"] if actual else "不明"
-            actual_payout = actual["payout"] if actual else 0
+        results.append(
+            {
+                "race_no": race_no,
+                "prediction": bet["combination"],
+                "bet_amount": amount,
+                "actual_result": race_result["trifecta"],
+                "payout_per_100": race_result["payout"],
+                "hit": hit,
+                "return_amount": return_amount,
+            }
+        )
 
-            if actual and bet["combination"] == actual["trifecta"]:
-                hit = True
-                return_amount = (amount // 100) * actual_payout
-                total_return += return_amount
+    race_pnl = total_return - total_bet
+    logger.info(f"Race {race_no}R: bet={total_bet}, return={total_return}, pnl={race_pnl}")
 
-            results.append(
-                {
-                    "race_no": race_no,
-                    "prediction": bet["combination"],
-                    "bet_amount": amount,
-                    "actual_result": actual_trifecta,
-                    "payout_per_100": actual_payout,
-                    "hit": hit,
-                    "return_amount": return_amount,
-                }
-            )
+    # 4. DynamoDB に結果保存
+    save_result(date, race_no, results, total_bet, total_return, race_pnl)
 
-    daily_pnl = total_return - total_bet
-    logger.info(f"Results: bet={total_bet}, return={total_return}, pnl={daily_pnl}")
+    # 5. 最終レースの場合、日次集計 + 累計収支更新
+    daily_summary = None
+    is_last_race = race_index == total_races
 
-    # 4. DynamoDB に結果保存 + 累計更新
-    save_evening_result(today, results, total_bet, total_return, daily_pnl)
-    cumulative = update_cumulative(today, total_bet, total_return, daily_pnl)
-    logger.info(f"Cumulative: {cumulative}")
+    if is_last_race:
+        logger.info("Last race of the day — computing daily summary")
+        schedule = get_schedule(date)
+        if schedule:
+            race_nos = [int(r["race_no"]) for r in schedule["races"]]
+            all_results = get_all_results_for_day(date, race_nos)
 
-    # 5. Discord通知
-    msg = build_evening_message(morning, results, total_bet, total_return, daily_pnl, cumulative)
+            day_total_bet = sum(int(r["total_bet"]) for r in all_results)
+            day_total_return = sum(int(r["total_return"]) for r in all_results)
+            day_pnl = day_total_return - day_total_bet
+            day_hit_count = sum(sum(1 for bet in r["results"] if bet["hit"]) for r in all_results)
+            day_total_bet_count = sum(len(r["results"]) for r in all_results)
+
+            cumulative = update_cumulative(date, day_total_bet, day_total_return, day_pnl)
+
+            daily_summary = {
+                "total_bet": day_total_bet,
+                "total_return": day_total_return,
+                "daily_pnl": day_pnl,
+                "hit_count": day_hit_count,
+                "total_bet_count": day_total_bet_count,
+                "cumulative": cumulative,
+            }
+
+    # 6. Discord通知
+    msg = build_post_race_message(
+        player_name,
+        venue_name,
+        race_no,
+        results,
+        total_bet,
+        total_return,
+        race_pnl,
+        race_index,
+        total_races,
+        daily_summary,
+    )
     send_discord_message(msg)
-    logger.info("Evening handler completed successfully")
+    logger.info(f"Post-race handler completed for {race_no}R")
 
     return {"statusCode": 200, "body": msg}
 
 
 def handler(event, context):
-    """EventBridge → Lambda エントリポイント (mode で朝/夜を切り替え)"""
-    mode = event.get("mode", "morning")
+    """EventBridge → Lambda エントリポイント (mode で切り替え)"""
+    global SCRAPER_FUNCTION_ARN
+    if not SCRAPER_FUNCTION_ARN and context:
+        SCRAPER_FUNCTION_ARN = context.invoked_function_arn
+
+    mode = event.get("mode", "schedule")
     logger.info(f"Scraper invoked. mode={mode}, RACER_NO={RACER_NO}")
 
     try:
-        if mode == "morning":
-            return morning_handler(event, context)
-        elif mode == "evening":
-            return evening_handler(event, context)
+        if mode == "schedule":
+            return schedule_handler(event, context)
+        elif mode == "pre_race":
+            return pre_race_handler(event, context)
+        elif mode == "post_race":
+            return post_race_handler(event, context)
         else:
             logger.error(f"Unknown mode: {mode}")
             return {"statusCode": 400, "body": f"Unknown mode: {mode}"}

@@ -86,7 +86,43 @@ Discord に依存しない汎用 AI エージェント。Docker コンテナと�
 | TAVILY_API_KEY              | Tavily Search API キー |
 | AGENT_OBSERVABILITY_ENABLED | OTEL トレース有効化    |
 
-### 4. IaC（AWS CDK）
+### 4. Lambda（Scraper - 自動予想・収支管理）
+
+レース単位の動的スケジューリングで予想→結果収集を自動化。
+
+ファイル: `lambda/scraper.py`
+
+3モード:
+
+| モード      | トリガー                           | 処理内容                                             |
+| ----------- | ---------------------------------- | ---------------------------------------------------- |
+| `schedule`  | EventBridge Rule (毎朝 JST 8:00)   | 出走予定取得 → Discord 通知 → 動的スケジュール作成   |
+| `pre_race`  | EventBridge Scheduler (締切10分前) | 出走表・直前情報・オッズ取得 → AI予想 → Discord 通知 |
+| `post_race` | EventBridge Scheduler (締切20分後) | レース結果取得 → 的中判定・収支計算 → Discord 通知   |
+
+予算: 1R あたり 5,000円固定。Discord 通知回数: `(レース数 × 2) + 1` / 日。
+
+環境変数:
+
+| 変数                 | 用途                                |
+| -------------------- | ----------------------------------- |
+| DISCORD_WEBHOOK_URL  | Discord Webhook 通知先              |
+| RACER_NO             | 追跡対象選手番号                    |
+| DYNAMODB_TABLE       | DynamoDB テーブル名                 |
+| SCHEDULER_ROLE_ARN   | EventBridge Scheduler 用 IAM ロール |
+| SCHEDULER_GROUP_NAME | EventBridge Scheduler グループ名    |
+| SCRAPER_FUNCTION_ARN | Scraper Lambda 自身の ARN           |
+
+DynamoDB スキーマ:
+
+| 用途         | PK           | SK                                |
+| ------------ | ------------ | --------------------------------- |
+| スケジュール | `{RACER_NO}` | `{YYYYMMDD}#schedule`             |
+| レース別予想 | `{RACER_NO}` | `{YYYYMMDD}#prediction#{race_no}` |
+| レース別結果 | `{RACER_NO}` | `{YYYYMMDD}#result#{race_no}`     |
+| 累計収支     | `{RACER_NO}` | `cumulative`                      |
+
+### 5. IaC（AWS CDK）
 
 ファイル: `lib/agentcore-discord-chatbot-stack.ts`
 
@@ -94,8 +130,13 @@ Discord に依存しない汎用 AI エージェント。Docker コンテナと�
 
 - `agentcore.Runtime` - AgentCore Runtime（Docker イメージ自動ビルド）
 - `lambda.Function` - Webhook Handler（Python バンドリング）
+- `lambda.Function` - Scraper（予想・収支管理）
 - `apigateway.RestApi` - REST API（Lambda プロキシ統合）
-- IAM ロール・ポリシー（Bedrock モデル呼び出し、Lambda → AgentCore 呼び出し、Lambda 自己呼び出し）
+- `dynamodb.Table` - 予想・結果・累計収支
+- `events.Rule` - 毎朝 JST 8:00 に Scraper 起動
+- `scheduler.CfnScheduleGroup` - レースごとの one-time schedule グループ
+- `iam.Role` - EventBridge Scheduler が Lambda を呼び出すためのロール
+- IAM ポリシー（Bedrock, AgentCore, Scheduler, DynamoDB, iam:PassRole）
 
 ## 利用可能なツール
 
@@ -169,7 +210,7 @@ agentcore-line-chatbot/
 ├── lib/agentcore-discord-chatbot-stack.ts # CDK スタック定義
 ├── lambda/
 │   ├── webhook.py                      # Discord Interactions Handler + SSE Bridge
-│   ├── scraper.py                      # 朝夜の予想・収支管理（Discord Webhook 通知）
+│   ├── scraper.py                      # レース単位の自動予想・収支管理（3モード: schedule/pre_race/post_race）
 │   └── requirements.txt               # PyNaCl, boto3
 ├── agent/
 │   ├── agent.py                        # Strands Agent（AgentCore Runtime 上で動作）

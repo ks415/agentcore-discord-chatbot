@@ -42,6 +42,8 @@ npx cdk deploy --hotswap --profile sandbox
 
 ## アーキテクチャ
 
+### 対話型チャットボット（Agent）
+
 リクエストフローは3段構成で、Agent は Discord に依存しない設計:
 
 ```
@@ -57,11 +59,33 @@ AgentCore Runtime (Docker コンテナ)
     → Tools: current_time, web_search(Tavily), fetch_race_info, clear_memory
 ```
 
+### 自動予想・収支管理（Scraper）
+
+レース単位の動的スケジューリングで予想→結果収集を自動化:
+
+```
+EventBridge Rule (毎朝 JST 8:00)
+  → Scraper Lambda (mode=schedule)
+    → kyoteibiyori.com で出走予定取得
+    → 出走情報を Discord Webhook 通知
+    → EventBridge Scheduler で各レースの動的スケジュール作成
+      → pre_race (締切10分前): 出走表・直前情報・オッズ取得 → Bedrock 予想 → Discord 通知
+      → post_race (締切20分後): レース結果取得 → 的中判定・収支計算 → Discord 通知
+```
+
+1日あたりの Discord 通知回数: `(レース数 × 2) + 1`
+
+- 1回: 朝のスケジュール通知
+- レース数 × 1: 各レース予想（pre_race）
+- レース数 × 1: 各レース結果（post_race、最終レースに累計収支含む）
+
 **Lambda (`lambda/webhook.py`)** — Discord Interactions Endpoint。Ed25519 署名検証、PING/PONG 応答、Deferred Response + 自己非同期呼び出しで AgentCore を呼び出し、Discord REST API でメッセージを編集。
+
+**Lambda (`lambda/scraper.py`)** — 3モード（schedule / pre_race / post_race）の自動予想・収支管理。EventBridge Rule（朝8時固定）と EventBridge Scheduler（レース時刻に応じた動的 one-time schedule）で駆動。予算は1Rあたり5,000円固定。
 
 **Agent (`agent/agent.py`)** — `BedrockAgentCoreApp` のエントリーポイント。`Agent.stream_async()` でストリーミング応答を生成。セッション管理は `_agent_sessions` dict で Agent インスタンスをキャッシュ（15分 TTL）。
 
-**CDK (`lib/agentcore-discord-chatbot-stack.ts`)** — AgentCore Runtime + Lambda + API Gateway を定義。Lambda は `grantInvokeRuntime` で AgentCore 呼び出し権限を付与。Lambda の自己呼び出し権限も付与（Deferred Response 用）。
+**CDK (`lib/agentcore-discord-chatbot-stack.ts`)** — AgentCore Runtime + Lambda + API Gateway + DynamoDB + EventBridge Rule + EventBridge Scheduler（IAM ロール・グループ）を定義。
 
 ## 設計上の注意点
 
@@ -93,7 +117,7 @@ agent/
   requirements.txt  # Python 依存（strands-agents, bedrock-agentcore, mcp 等）
 lambda/
   webhook.py        # Discord Interactions ハンドラ（署名検証、Deferred Response、SSE→Discord Message Edit 変換）
-  scraper.py        # 朝夜の予想・収支管理 Lambda（Discord Webhook で通知）
+  scraper.py        # レース単位の自動予想・収支管理 Lambda（3モード: schedule/pre_race/post_race）
   requirements.txt  # Python 依存（PyNaCl, boto3）
 scripts/
   register_commands.py  # Discord スラッシュコマンド登録スクリプト

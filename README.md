@@ -5,7 +5,7 @@ Discord で動くボートレース（競艇）専門 AI チャットボット�
 ## 概要
 
 Discord で `/ask` スラッシュコマンドを送ると、競艇専門 AI エージェント「競艇 AI Bot」が boatrace.jp や競艇日和のデータを取得・分析して、レース予想や選手情報を回答します。
-さらに、毎日自動で指定選手の AI 予想を朝に生成し、夜にレース結果と照合して収支管理を行います。
+さらに、毎朝自動で指定選手の出走予定を取得し、各レースの締切時刻に合わせて動的に AI 予想を生成、レース後に結果を照合して収支管理を行います。
 
 ## システム構成
 
@@ -14,8 +14,9 @@ Discord で `/ask` スラッシュコマンドを送ると、競艇専門 AI エ
 | IaC       | AWS CDK (TypeScript) + AgentCore L2 コンストラクト |
 | Webhook   | API Gateway (REST) + Lambda (Python 3.13 / ARM64)  |
 | Agent     | Strands Agents on Bedrock AgentCore Runtime        |
-| LLM       | Claude Sonnet 4.5 on Amazon Bedrock                |
-| Predictor | Lambda (Python 3.13) + EventBridge Scheduler × 2   |
+| LLM       | Claude Sonnet 4.6 on Amazon Bedrock                |
+| Scheduler | EventBridge Rule + EventBridge Scheduler (動的)    |
+| Predictor | Lambda (Python 3.13 / ARM64)                       |
 | Storage   | DynamoDB (予想・結果・累計収支)                    |
 
 ## 機能
@@ -31,28 +32,41 @@ Discord で `/ask` スラッシュコマンドを送ると、競艇専門 AI エ
 - Deferred Response でスムーズな UX（「考え中...」表示）
 - 会話履歴の保持（セッション管理、15分 TTL）
 
-### AI 予想＋収支管理（EventBridge → Lambda → DynamoDB）
+### 自動予想＋収支管理（EventBridge → Lambda → DynamoDB）
 
-**🌅 朝 8:00 JST — AI 予想生成**
+レース単位の動的スケジューリングで、予想→結果収集を自動化します。
+
+**📋 朝 8:00 JST — スケジュール取得**
 
 1. 競艇日和から指定選手の出走予定をスクレイピング
-2. boatrace.jp から各レースの出走表を取得
-3. Bedrock Claude に出走表データを送り、3連単予想＋資金配分を生成
-4. 予想結果を DynamoDB に保存し、Discord Webhook で予想通知を送信
+2. 出走情報を Discord Webhook で通知
+3. 各レースの締切時刻に合わせて EventBridge Scheduler で動的スケジュールを作成
 
-**🌙 夜 22:00 JST — 結果収集＋収支計算**
+**🏁 各レース締切10分前 — AI 予想生成（pre_race）**
 
-1. DynamoDB から朝の予想データを読み出し
-2. boatrace.jp の結果一覧ページから全レースの 3連単結果＋払戻金を取得
-3. 予想と結果を照合して的中判定（賭け金 ÷ 100 × 払戻金 = 回収額）
-4. 日次収支と累計収支を DynamoDB に記録し、Discord Webhook で結果通知を送信
+1. boatrace.jp から出走表・直前情報・オッズを取得
+2. Bedrock Claude に全データを送り、3連単予想＋資金配分を生成
+3. 予想結果を DynamoDB に保存し、Discord Webhook で予想通知を送信
+
+**📊 各レース締切20分後 — 結果収集＋収支計算（post_race）**
+
+1. boatrace.jp の個別レース結果ページから3連単結果＋払戻金を取得
+2. DynamoDB の予想データと照合して的中判定（賭け金 ÷ 100 × 払戻金 = 回収額）
+3. 日次収支を DynamoDB に記録し、Discord Webhook で結果通知を送信
+4. その日の最終レースなら累計収支も更新して表示
+
+**1日あたりの Discord 通知回数**: `(レース数 × 2) + 1`
+
+- 1回: 朝のスケジュール通知
+- レース数 × 1: 各レース予想（pre_race）
+- レース数 × 1: 各レース結果（post_race、最終レースに累計収支含む）
 
 **設定値**
 
-- 1日の仮想予算: 10,000円
+- 1レースあたりの仮想予算: 5,000円
 - 舟券の種類: 3連単のみ
 - 対象選手: 環境変数 `RACER_NO` で指定（デフォルト: 3941 池田浩二）
-- 出走予定がない日は朝に「出走なし」通知、夜はスキップ
+- 出走予定がない日は朝に「出走なし」通知のみ
 
 ### エージェントのツール一覧
 
@@ -149,7 +163,5 @@ npx cdk diff --profile your-profile                # 差分確認
 ### ローカルデバッグ
 
 ```bash
-python scripts/debug_scraper.py                      # 出走予定パース
-python scripts/debug_scraper.py morning               # 出走予定 + 出走表取得テスト
-python scripts/debug_scraper.py resultlist 01 20260209 # 結果一覧パースのテスト（会場コード 日付）
+python scripts/debug_scraper.py              # 出走予定パースのテスト
 ```
