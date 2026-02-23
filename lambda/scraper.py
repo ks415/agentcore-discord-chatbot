@@ -433,9 +433,16 @@ class RaceResultParser(HTMLParser):
         self._trifecta_numbers: list[str] = []
         self._trifecta_payout: int | None = None
 
+        # 返還艇の検出
+        self._in_refund_section = False  # <th>返還</th> の後のセクション
+        self._found_refund_header = False
+        self._in_refund_number_span = False
+        self._refunded_boats: list[str] = []  # 返還対象の艇番号
+
         # 結果
         self.trifecta: str = ""  # "X-Y-Z"
         self.payout: int = 0
+        self.refunded_boats: list[str] = []  # フライング等で返還となった艇番号
 
     def handle_starttag(self, tag, attrs):
         attr_dict = dict(attrs)
@@ -448,21 +455,35 @@ class RaceResultParser(HTMLParser):
         if tag == "td":
             self._in_td = True
 
+        if tag == "th":
+            self._in_td = True  # th もテキスト読み取り対象
+
         if tag == "span" and self._in_tbody:
             self._in_span = True
             self._current_span_class = cls
-            if "numberSet1_number" in cls and not self._found_trifecta:
-                self._in_number_span = True
+            if "numberSet1_number" in cls:
+                if self._in_refund_section:
+                    self._in_refund_number_span = True
+                elif not self._found_trifecta:
+                    self._in_number_span = True
             if "is-payout1" in cls and not self._found_trifecta:
                 self._in_payout_span = True
 
     def handle_endtag(self, tag):
         if tag == "td":
             self._in_td = False
+        if tag == "th":
+            self._in_td = False
         if tag == "span":
             self._in_span = False
             self._in_number_span = False
             self._in_payout_span = False
+            self._in_refund_number_span = False
+
+        if tag == "table" and self._in_refund_section:
+            # 返還テーブル終了
+            self._in_refund_section = False
+            self.refunded_boats = list(self._refunded_boats)
 
         if tag == "tbody" and self._in_tbody:
             self._in_tbody = False
@@ -484,6 +505,16 @@ class RaceResultParser(HTMLParser):
 
         if self._in_tbody:
             self._tbody_texts.append(text)
+
+        # 返還ヘッダの検出: <th>返還</th>
+        if self._in_td and text == "返還":
+            self._found_refund_header = True
+            self._in_refund_section = True
+
+        # 返還セクション内の艇番号
+        if self._in_refund_number_span:
+            if text.isdigit():
+                self._refunded_boats.append(text)
 
         if self._in_number_span and not self._found_trifecta:
             if text.isdigit():
@@ -574,6 +605,7 @@ def parse_race_result(html: str) -> dict:
     return {
         "trifecta": parser.trifecta,
         "payout": parser.payout,
+        "refunded_boats": parser.refunded_boats,
     }
 
 
@@ -907,23 +939,35 @@ def build_post_race_message(
     lines.append("")
 
     actual_result = results[0]["actual_result"] if results else "不明"
+    refunded_boats = [r for r in results if r.get("refunded")]
+    non_refunded = [r for r in results if not r.get("refunded")]
     lines.append(f"▶ {race_no}R 結果: {actual_result}")
 
     for r in results:
-        mark = "✅" if r["hit"] else "❌"
-        line = f"  {mark} {r['prediction']} → {int(r['bet_amount']):,}円"
-        if r["hit"]:
-            line += f" → 🎉 {int(r['return_amount']):,}円"
+        if r.get("refunded"):
+            mark = "🔄"
+            line = f"  {mark} {r['prediction']} → {int(r['bet_amount']):,}円（返還）"
+        elif r["hit"]:
+            mark = "✅"
+            line = f"  {mark} {r['prediction']} → {int(r['bet_amount']):,}円 → 🎉 {int(r['return_amount']):,}円"
+        else:
+            mark = "❌"
+            line = f"  {mark} {r['prediction']} → {int(r['bet_amount']):,}円"
         lines.append(line)
 
     lines.append("")
+    # 返還分は収支計算から除外
+    effective_bet = sum(int(r["bet_amount"]) for r in non_refunded)
     pnl_sign = "+" if race_pnl >= 0 else ""
     hit_count = sum(1 for r in results if r["hit"])
     lines.append(f"📊 {race_no}R 収支")
-    lines.append(f"  投資: {total_bet:,}円")
+    if refunded_boats:
+        refund_total = sum(int(r["bet_amount"]) for r in refunded_boats)
+        lines.append(f"  返還: {refund_total:,}円（{len(refunded_boats)}本）")
+    lines.append(f"  投資: {effective_bet:,}円")
     lines.append(f"  回収: {total_return:,}円")
     lines.append(f"  損益: {pnl_sign}{race_pnl:,}円")
-    lines.append(f"  的中: {hit_count}/{len(results)}本")
+    lines.append(f"  的中: {hit_count}/{len(non_refunded)}本")
 
     # 最終レースの場合、日次まとめ + 累計収支を追加
     if daily_summary:
@@ -1182,23 +1226,49 @@ def post_race_handler(event, context):
     logger.info(f"Fetching raceresult: {result_url}")
     html = fetch_page(result_url)
     race_result = parse_race_result(html)
-    logger.info(f"Race result: trifecta={race_result['trifecta']}, payout={race_result['payout']}")
+    refunded_boats = race_result.get("refunded_boats", [])
+    logger.info(
+        f"Race result: trifecta={race_result['trifecta']}, payout={race_result['payout']}, refunded_boats={refunded_boats}"
+    )
 
     if not race_result["trifecta"]:
         msg = f"⚠️ {race_no}R の結果を取得できませんでした（レース中止またはデータ未反映の可能性）"
         send_discord_message(msg)
         return {"statusCode": 200, "body": msg}
 
-    # 3. 予想と結果を照合
+    # 3. 予想と結果を照合（返還艇を含む買い目は返還扱い）
     total_bet = 0
     total_return = 0
+    total_refund = 0
     results = []
 
     for bet in prediction.get("bets", []):
         amount = int(bet["amount"])
+        combo = bet["combination"]
+
+        # 返還判定: 買い目に返還艇が含まれていれば全額返還
+        combo_boats = combo.replace("-", "")
+        is_refunded = any(b in combo_boats for b in refunded_boats)
+
+        if is_refunded:
+            total_refund += amount
+            results.append(
+                {
+                    "race_no": race_no,
+                    "prediction": combo,
+                    "bet_amount": amount,
+                    "actual_result": race_result["trifecta"],
+                    "payout_per_100": race_result["payout"],
+                    "hit": False,
+                    "return_amount": amount,  # 全額返還
+                    "refunded": True,
+                }
+            )
+            continue
+
         total_bet += amount
 
-        hit = bet["combination"] == race_result["trifecta"]
+        hit = combo == race_result["trifecta"]
         return_amount = 0
         if hit:
             return_amount = (amount // 100) * race_result["payout"]
@@ -1207,12 +1277,13 @@ def post_race_handler(event, context):
         results.append(
             {
                 "race_no": race_no,
-                "prediction": bet["combination"],
+                "prediction": combo,
                 "bet_amount": amount,
                 "actual_result": race_result["trifecta"],
                 "payout_per_100": race_result["payout"],
                 "hit": hit,
                 "return_amount": return_amount,
+                "refunded": False,
             }
         )
 
