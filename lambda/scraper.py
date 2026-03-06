@@ -43,6 +43,7 @@ RACE_BUDGET = 5000  # 1レースあたりの予算（円）
 JST = timezone(timedelta(hours=9))
 MODEL_ID = "us.anthropic.claude-sonnet-4-6"
 KYOTEIBIYORI_BASE = "https://kyoteibiyori.com/racer/racer_no"
+KYOTEIBIYORI_RACE_BASE = "https://kyoteibiyori.com/race_shusso.php"
 BOATRACE_BASE = "https://www.boatrace.jp/owpc/pc/race"
 _USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -1164,9 +1165,10 @@ def pre_race_handler(event, context):
     racelist_text = fetch_and_extract_text(racelist_url)
     time.sleep(1)
 
-    # 直前情報
-    beforeinfo_url = f"{BOATRACE_BASE}/beforeinfo?rno={race_no}&jcd={jcd}&hd={date}"
-    logger.info(f"Fetching beforeinfo: {beforeinfo_url}")
+    # 直前情報（競艇日和）
+    place_no = int(jcd)
+    beforeinfo_url = f"{KYOTEIBIYORI_RACE_BASE}?place_no={place_no}&race_no={race_no}&hiduke={date}&slider=4"
+    logger.info(f"Fetching beforeinfo (kyoteibiyori): {beforeinfo_url}")
     beforeinfo_text = fetch_and_extract_text(beforeinfo_url)
     time.sleep(1)
 
