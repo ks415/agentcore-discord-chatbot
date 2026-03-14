@@ -685,6 +685,7 @@ def invoke_bedrock_prediction(
     racelist_text: str,
     beforeinfo_text: str,
     odds_text: str,
+    wakubetsu_text: str = "",
 ) -> dict:
     """Bedrock Claude に出走表・直前情報・オッズを送り1レース分の3連単予想を生成する"""
 
@@ -706,6 +707,7 @@ def invoke_bedrock_prediction(
 - 直前情報の展示タイム・スタート展示を重視
 - {player_name}の枠番・コースを特に注目
 - {player_name}は {course_info}
+- 枠別情報（コース別1着率・2連対率・3連対率、平均ST、決まり手傾向）を特に重視
 
 【レース情報】
 会場: {venue_name}
@@ -714,6 +716,9 @@ def invoke_bedrock_prediction(
 
 【出走表】
 {racelist_text}
+
+【枠別情報（コース別勝率・ST・決まり手）】
+{wakubetsu_text}
 
 【直前情報】
 {beforeinfo_text}
@@ -1165,8 +1170,14 @@ def pre_race_handler(event, context):
     racelist_text = fetch_and_extract_text(racelist_url)
     time.sleep(1)
 
-    # 直前情報（競艇日和）
+    # 枠別情報（競艇日和 slider=1）
     place_no = int(jcd)
+    wakubetsu_url = f"{KYOTEIBIYORI_RACE_BASE}?place_no={place_no}&race_no={race_no}&hiduke={date}&slider=1"
+    logger.info(f"Fetching wakubetsu (kyoteibiyori): {wakubetsu_url}")
+    wakubetsu_text = fetch_and_extract_text(wakubetsu_url, max_length=8000)
+    time.sleep(1)
+
+    # 直前情報（競艇日和 slider=4）
     beforeinfo_url = f"{KYOTEIBIYORI_RACE_BASE}?place_no={place_no}&race_no={race_no}&hiduke={date}&slider=4"
     logger.info(f"Fetching beforeinfo (kyoteibiyori): {beforeinfo_url}")
     beforeinfo_text = fetch_and_extract_text(beforeinfo_url)
@@ -1188,6 +1199,7 @@ def pre_race_handler(event, context):
         racelist_text=racelist_text,
         beforeinfo_text=beforeinfo_text,
         odds_text=odds_text,
+        wakubetsu_text=wakubetsu_text,
     )
     logger.info(f"Prediction: {json.dumps(prediction, ensure_ascii=False)[:500]}")
 
