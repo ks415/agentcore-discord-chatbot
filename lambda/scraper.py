@@ -552,15 +552,20 @@ def fetch_racer_page(racer_no: str) -> str:
     return fetch_page(f"{KYOTEIBIYORI_BASE}/{racer_no}")
 
 
-def fetch_and_extract_text(url: str, max_length: int = 6000) -> str:
-    """URLのHTMLを取得してテキストに変換する"""
-    html = fetch_page(url)
+def extract_text_from_html(html: str, max_length: int = 6000) -> str:
+    """HTML文字列をテキストに変換する"""
     extractor = _HTMLTextExtractor()
     extractor.feed(html)
     text = extractor.get_text()
     if len(text) > max_length:
         text = text[:max_length] + "\n...(以下省略)"
     return text
+
+
+def fetch_and_extract_text(url: str, max_length: int = 6000) -> str:
+    """URLのHTMLを取得してテキストに変換する"""
+    html = fetch_page(url)
+    return extract_text_from_html(html, max_length=max_length)
 
 
 # =============================================
@@ -608,6 +613,70 @@ def parse_race_result(html: str) -> dict:
         "payout": parser.payout,
         "refunded_boats": parser.refunded_boats,
     }
+
+
+def parse_trifecta_odds_from_html(html: str) -> dict[str, str]:
+    """3連単オッズHTMLから買い目ごとのオッズを抽出する。"""
+    odds_map: dict[str, str] = {}
+    if not html:
+        return odds_map
+
+    table_match = re.search(r"3連単オッズ.*?<table>(.*?)</table>", html, re.S)
+    if not table_match:
+        return odds_map
+
+    table_html = table_match.group(1)
+    thead_match = re.search(r"<thead.*?>(.*?)</thead>", table_html, re.S)
+    tbody_match = re.search(r"<tbody.*?>(.*?)</tbody>", table_html, re.S)
+    if not thead_match or not tbody_match:
+        return odds_map
+
+    thead_html = thead_match.group(1)
+    first_boats = re.findall(r'<th[^>]*class="[^"]*is-boatColor\d[^"]*"[^>]*>\s*([1-6])\s*</th>', thead_html)
+    if not first_boats:
+        return odds_map
+
+    tbody_html = tbody_match.group(1)
+    rows = re.findall(r"<tr>(.*?)</tr>", tbody_html, re.S)
+    second_boats: list[str | None] = [None] * len(first_boats)
+
+    for row_html in rows:
+        cells = re.findall(r"<td([^>]*)>(.*?)</td>", row_html, re.S)
+        idx = 0
+        for group_idx in range(len(first_boats)):
+            if idx >= len(cells):
+                break
+            attrs, content = cells[idx]
+            text = re.sub(r"<[^>]+>", "", content).strip()
+            class_match = re.search(r'class="([^"]*)"', attrs)
+            class_val = class_match.group(1) if class_match else ""
+            is_second = ("rowspan" in attrs) or ("is-fs14" in class_val)
+
+            if is_second:
+                if text.isdigit():
+                    second_boats[group_idx] = text
+                idx += 1
+
+            second = second_boats[group_idx]
+            if idx + 1 >= len(cells):
+                break
+
+            third_text = re.sub(r"<[^>]+>", "", cells[idx][1]).strip()
+            idx += 1
+            odds_text = re.sub(r"<[^>]+>", "", cells[idx][1]).strip()
+            idx += 1
+
+            if not (second and third_text and second.isdigit() and third_text.isdigit()):
+                continue
+
+            odds_val = re.sub(r"[^0-9.]", "", odds_text)
+            if not odds_val:
+                continue
+
+            combo = f"{first_boats[group_idx]}-{second}-{third_text}"
+            odds_map[combo] = odds_val
+
+    return odds_map
 
 
 def parse_deadline_time(deadline_str: str, today: str) -> datetime | None:
@@ -899,7 +968,13 @@ def build_schedule_message(data: dict, races: list[dict]) -> str:
 
 
 def build_pre_race_message(
-    player_name: str, venue_name: str, race_no: int, prediction: dict, race_index: int, total_races: int
+    player_name: str,
+    venue_name: str,
+    race_no: int,
+    prediction: dict,
+    race_index: int,
+    total_races: int,
+    odds_map: dict[str, str] | None = None,
 ) -> str:
     """レース予想メッセージを組み立てる"""
     name = player_name or f"選手{RACER_NO}"
@@ -914,8 +989,12 @@ def build_pre_race_message(
         lines.append("")
 
     lines.append("【AI予想（3連単）】")
+    odds_map = odds_map or {}
     for bet in prediction.get("bets", []):
-        lines.append(f"  🎯 {bet['combination']}  {int(bet['amount']):,}円")
+        combo = bet["combination"]
+        odds = odds_map.get(combo)
+        odds_label = f"  (odds {odds})" if odds else "  (odds -)"
+        lines.append(f"  🎯 {combo}  {int(bet['amount']):,}円{odds_label}")
         if bet.get("reasoning"):
             lines.append(f"     └ {bet['reasoning']}")
 
@@ -1184,9 +1263,12 @@ def pre_race_handler(event, context):
     time.sleep(1)
 
     # オッズ（3連単）
-    odds_url = f"{BOATRACE_BASE}/oddstf?rno={race_no}&jcd={jcd}&hd={date}"
+    odds_url = f"{BOATRACE_BASE}/odds3t?rno={race_no}&jcd={jcd}&hd={date}"
     logger.info(f"Fetching odds: {odds_url}")
-    odds_text = fetch_and_extract_text(odds_url, max_length=8000)
+    odds_html = fetch_page(odds_url)
+    odds_text_full = extract_text_from_html(odds_html, max_length=20000)
+    odds_text = odds_text_full if len(odds_text_full) <= 8000 else odds_text_full[:8000] + "\n...(以下省略)"
+    odds_map = parse_trifecta_odds_from_html(odds_html)
 
     # 2. Bedrock Claude で予想を生成
     logger.info(f"Invoking Bedrock for prediction (race {race_no}R)...")
@@ -1207,7 +1289,15 @@ def pre_race_handler(event, context):
     save_prediction(date, race_no, prediction, venue_name, jcd, player_name)
 
     # 4. Discord通知
-    msg = build_pre_race_message(player_name, venue_name, race_no, prediction, race_index, total_races)
+    msg = build_pre_race_message(
+        player_name,
+        venue_name,
+        race_no,
+        prediction,
+        race_index,
+        total_races,
+        odds_map=odds_map,
+    )
     send_discord_message(msg)
     logger.info(f"Pre-race handler completed for {race_no}R")
 
