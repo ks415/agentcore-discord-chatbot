@@ -150,7 +150,8 @@ export class AgentcoreDiscordChatbotStack extends cdk.Stack {
           ],
         },
       }),
-      timeout: cdk.Duration.seconds(180),
+      // schedule モードは選手データ先読みで最大30ページ超をフェッチするため余裕を持たせる
+      timeout: cdk.Duration.seconds(300),
       memorySize: 512,
       environment: {
         DISCORD_WEBHOOK_URL: process.env.DISCORD_WEBHOOK_URL || "",
@@ -158,6 +159,12 @@ export class AgentcoreDiscordChatbotStack extends cdk.Stack {
         DYNAMODB_TABLE: predictionTable.tableName,
         SCHEDULER_ROLE_ARN: schedulerRole.roleArn,
         SCHEDULER_GROUP_NAME: schedulerGroup.name!,
+        // ベットエンジン設定（Python 側にも同じデフォルトあり。.env.local で上書き可能）
+        EV_THRESHOLD: process.env.EV_THRESHOLD || "1.10",
+        PROB_FLOOR: process.env.PROB_FLOOR || "0.03",
+        BLEND_LAMBDA: process.env.BLEND_LAMBDA || "0.5",
+        MAX_BETS: process.env.MAX_BETS || "5",
+        RACE_BUDGET: process.env.RACE_BUDGET || "5000",
       },
     });
 
@@ -193,6 +200,8 @@ export class AgentcoreDiscordChatbotStack extends cdk.Stack {
       new iam.PolicyStatement({
         actions: [
           "scheduler:CreateSchedule",
+          // Lambda 非同期リトライ時は既存スケジュールに ConflictException → UpdateSchedule で冪等に上書きする
+          "scheduler:UpdateSchedule",
           "scheduler:DeleteSchedule",
           "scheduler:GetSchedule",
         ],
