@@ -1,3 +1,4 @@
+import gzip
 import json
 import logging
 import os
@@ -138,9 +139,9 @@ def web_search(query: str) -> str:
 
 @tool
 def fetch_race_info(url: str) -> str:
-    """boatrace.jp または kyoteibiyori.com のページを取得してテキスト情報を抽出します。
+    """boatrace.jp / kyoteibiyori.com / boatrace-db.net のページを取得してテキスト情報を抽出します。
     出走表、オッズ、レース結果、選手情報などの詳細データを得るために使います。
-    この2ドメイン以外のURLは拒否されます。
+    この3ドメイン以外のURLは拒否されます。
 
     主なURL構成パターン:
     【boatrace.jp（公式）】
@@ -153,8 +154,13 @@ def fetch_race_info(url: str) -> str:
     - 選手情報: https://kyoteibiyori.com/racer/racer_no/{選手番号}
     - 出走表: https://kyoteibiyori.com/race_shusso.php?place_no={会場コード}&hiduke={yyyymmdd}&race_no={R番号}
 
+    【boatrace-db.net（艇国データバンク）】
+    - キャリア通算成績（コース別・場別・グレード別）: https://boatrace-db.net/racer/aresult/regno/{選手番号}/
+    - コース別成績・直近6ヶ月（当該選手が{n}コース進入時の全艇着順分布と決まり手）:
+      https://boatrace-db.net/racer/rcourse/regno/{選手番号}/course/{n}/
+
     Args:
-        url: 取得するページのURL（boatrace.jp または kyoteibiyori.com のみ）
+        url: 取得するページのURL（boatrace.jp / kyoteibiyori.com / boatrace-db.net のみ）
 
     Returns:
         ページから抽出したテキスト情報
@@ -162,11 +168,11 @@ def fetch_race_info(url: str) -> str:
     from urllib.parse import urlparse
 
     parsed = urlparse(url)
-    allowed_hosts = ("www.boatrace.jp", "boatrace.jp", "kyoteibiyori.com")
+    allowed_hosts = ("www.boatrace.jp", "boatrace.jp", "kyoteibiyori.com", "boatrace-db.net")
     if parsed.hostname not in allowed_hosts:
         return (
             f"エラー: {parsed.hostname} へのアクセスは許可されていません。"
-            "boatrace.jp または kyoteibiyori.com のURLを指定してください。"
+            "boatrace.jp / kyoteibiyori.com / boatrace-db.net のURLを指定してください。"
         )
 
     try:
@@ -179,7 +185,11 @@ def fetch_race_info(url: str) -> str:
             },
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
-            html = resp.read().decode("utf-8")
+            raw = resp.read()
+            # boatrace-db.net は gzip を強制配信するため自動展開する
+            if resp.headers.get("Content-Encoding") == "gzip" or raw[:2] == b"\x1f\x8b":
+                raw = gzip.decompress(raw)
+            html = raw.decode("utf-8", errors="replace")
 
         extractor = _HTMLTextExtractor()
         extractor.feed(html)
