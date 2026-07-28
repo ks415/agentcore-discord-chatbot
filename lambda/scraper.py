@@ -59,6 +59,13 @@ PROB_FLOOR = float(os.environ.get("PROB_FLOOR", "0.03"))  # 買い目の最低�
 BLEND_LAMBDA = float(os.environ.get("BLEND_LAMBDA", "0.5"))  # モデル確率と市場確率のブレンド比
 MAX_BETS = int(os.environ.get("MAX_BETS", "5"))  # 最大点数
 PROMPT_VERSION = 2  # 予想プロンプトの版数（DynamoDB に記録して後から分析可能にする）
+
+# --- スケジューリング定数 ---
+PRE_RACE_LEAD_MINUTES = 10  # 予想は締切の何分前に出すか
+POST_RACE_LAG_MINUTES = 20  # 結果取得は締切の何分後に行うか
+DEADLINE_DRIFT_TOLERANCE_MINUTES = 5  # 締切ズレの許容幅（これを超えたら再スケジュール）
+POST_RACE_RETRY_MINUTES = 10  # 結果が未反映だった場合の再取得間隔
+POST_RACE_MAX_RETRIES = 3  # 結果取得のリトライ上限
 _USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
@@ -730,6 +737,41 @@ def parse_deadline_time(deadline_str: str, today: str) -> datetime | None:
     return datetime(year, month, day, hour, minute, tzinfo=JST)
 
 
+def parse_official_deadlines(html: str) -> dict[int, str]:
+    """boatrace.jp の raceindex HTML から全レースの締切時刻を抽出する。
+
+    各レースは1つの <tbody>。先頭セルが rno リンク付きのレース番号、
+    その次のセルが締切時刻（"HH:MM"）。
+    """
+    deadlines: dict[int, str] = {}
+    for body in re.findall(r"<tbody[^>]*>(.*?)</tbody>", html, re.S):
+        rno_m = re.search(r"rno=(\d+)", body)
+        if not rno_m:
+            continue
+        # 選手名などの誤検出を避けるため先頭3セルだけ見る
+        for cell in re.findall(r"<td[^>]*>(.*?)</td>", body, re.S)[:3]:
+            time_m = re.search(r"(\d{1,2}:\d{2})", _strip_tags(cell))
+            if time_m:
+                deadlines[int(rno_m.group(1))] = time_m.group(1)
+                break
+    return deadlines
+
+
+def fetch_official_deadlines(jcd: str, date: str) -> dict[int, str]:
+    """boatrace.jp 公式から当該場・当日の全レース締切時刻を取得する（失敗時は空dict）。
+
+    競艇日和の締切時刻は朝の時点では暫定値で、SG初日などは日中に正式時程へ
+    更新されることがある（2026-07-28 のびわこ12R: 朝16:35 → 実際17:08）。
+    公式の番組表を正とし、pre_race 発火時にも再検証する。
+    """
+    url = f"{BOATRACE_BASE}/raceindex?jcd={jcd}&hd={date}"
+    try:
+        return parse_official_deadlines(fetch_page(url, retries=1))
+    except Exception as e:
+        logger.warning(f"fetch_official_deadlines failed ({url}): {e}")
+        return {}
+
+
 def detect_grade(race_title: str | None) -> str:
     """大会タイトルからグレード（SG/G1/G2/G3/一般）を判定する"""
     title = (race_title or "").upper()
@@ -1240,6 +1282,47 @@ def create_one_time_schedule(
             ActionAfterCompletion="DELETE",
         )
         logger.info(f"Updated existing schedule: {schedule_name} at {schedule_expression}")
+
+
+def schedule_race_jobs(today: str, race_no: int, deadline_dt: datetime, base_payload: dict, suffix: str = "") -> int:
+    """1レース分の pre_race / post_race スケジュールを作成する（過去時刻はスキップ）。
+
+    suffix は再スケジュール時に別名にするために使う。one-time スケジュールは
+    ActionAfterCompletion=DELETE で発火後に自動削除されるため、実行中の自分自身と
+    同名で作り直すと削除に巻き込まれる。必ず別名にすること。
+    """
+    now_jst = datetime.now(JST)
+    created = 0
+
+    pre_race_time = deadline_dt - timedelta(minutes=PRE_RACE_LEAD_MINUTES)
+    if pre_race_time > now_jst:
+        create_one_time_schedule(
+            schedule_name=f"pre-race-{today}-{race_no}{suffix}",
+            fire_at_utc=pre_race_time.astimezone(timezone.utc),
+            payload={**base_payload, "mode": "pre_race"},
+        )
+        created += 1
+        logger.info(f"Scheduled pre_race for {race_no}R at {pre_race_time.strftime('%H:%M')} JST")
+    else:
+        logger.warning(
+            f"Skipping pre_race for {race_no}R — time already passed ({pre_race_time.strftime('%H:%M')} JST)"
+        )
+
+    post_race_time = deadline_dt + timedelta(minutes=POST_RACE_LAG_MINUTES)
+    if post_race_time > now_jst:
+        create_one_time_schedule(
+            schedule_name=f"post-race-{today}-{race_no}{suffix}",
+            fire_at_utc=post_race_time.astimezone(timezone.utc),
+            payload={**base_payload, "mode": "post_race"},
+        )
+        created += 1
+        logger.info(f"Scheduled post_race for {race_no}R at {post_race_time.strftime('%H:%M')} JST")
+    else:
+        logger.warning(
+            f"Skipping post_race for {race_no}R — time already passed ({post_race_time.strftime('%H:%M')} JST)"
+        )
+
+    return created
 
 
 # =============================================
@@ -2468,6 +2551,19 @@ def schedule_handler(event, context):
     total_races = len(races)
     logger.info(f"Found {total_races} races")
 
+    # 3.5 締切時刻を boatrace.jp 公式でクロスチェックする
+    #     競艇日和の締切は朝の時点では暫定値のことがあり、SG初日などは
+    #     日中に正式時程へ更新される（2026-07-28 びわこ12R: 朝16:35 → 実際17:08）
+    official_deadlines = fetch_official_deadlines(jcd, today)
+    for race in races:
+        official = official_deadlines.get(race["race_no"])
+        if official and official != race["deadline"]:
+            logger.warning(
+                f"Deadline mismatch for {race['race_no']}R: kyoteibiyori={race['deadline']} "
+                f"official={official} — 公式を採用"
+            )
+            race["deadline"] = official
+
     # 4. EventBridge Scheduler で各レースの pre_race / post_race スケジュールを作成
     now_jst = datetime.now(JST)
     schedules_created = 0
@@ -2493,33 +2589,7 @@ def schedule_handler(event, context):
             "course_info": race["course"],
         }
 
-        # pre_race: 締切10分前
-        pre_race_time = deadline_dt - timedelta(minutes=10)
-        if pre_race_time > now_jst:
-            pre_race_utc = pre_race_time.astimezone(timezone.utc)
-            create_one_time_schedule(
-                schedule_name=f"pre-race-{today}-{race_no}",
-                fire_at_utc=pre_race_utc,
-                payload={**base_payload, "mode": "pre_race"},
-            )
-            schedules_created += 1
-            logger.info(f"Scheduled pre_race for {race_no}R at {pre_race_time.strftime('%H:%M')} JST")
-        else:
-            logger.warning(f"Skipping pre_race for {race_no}R — time already passed ({pre_race_time.strftime('%H:%M')} JST)")
-
-        # post_race: 締切20分後
-        post_race_time = deadline_dt + timedelta(minutes=20)
-        if post_race_time > now_jst:
-            post_race_utc = post_race_time.astimezone(timezone.utc)
-            create_one_time_schedule(
-                schedule_name=f"post-race-{today}-{race_no}",
-                fire_at_utc=post_race_utc,
-                payload={**base_payload, "mode": "post_race"},
-            )
-            schedules_created += 1
-            logger.info(f"Scheduled post_race for {race_no}R at {post_race_time.strftime('%H:%M')} JST")
-        else:
-            logger.warning(f"Skipping post_race for {race_no}R — time already passed ({post_race_time.strftime('%H:%M')} JST)")
+        schedules_created += schedule_race_jobs(today, race_no, deadline_dt, base_payload)
 
     # 5. DynamoDB に保存
     save_schedule(today, data, venue_name, jcd, races)
@@ -2552,6 +2622,34 @@ def pre_race_handler(event, context):
 
     logger.info(f"Pre-race handler: race_no={race_no}, venue={venue_name}, date={date}")
     data_warnings: list[str] = []
+
+    # 0. 締切時刻の再検証（自己修復）
+    #    朝に取得した締切は暫定値のことがあり、日中に正式時程へ更新される場合がある
+    #    （2026-07-28 びわこ12R: 朝16:35 → 実際17:08。43分早く予想が出てしまった）
+    reschedule_count = int(event.get("reschedule_count", 0))
+    official_str = fetch_official_deadlines(jcd, date).get(race_no)
+    official_dt = parse_deadline_time(official_str, date) if official_str else None
+    if official_dt and reschedule_count < 2:
+        lead_minutes = (official_dt - datetime.now(JST)).total_seconds() / 60
+        if lead_minutes > PRE_RACE_LEAD_MINUTES + DEADLINE_DRIFT_TOLERANCE_MINUTES:
+            # 締切が後ろにずれている → 予想せずスケジュールを作り直す（別名で作成）
+            logger.warning(
+                f"Deadline drifted for {race_no}R: official={official_str} "
+                f"(lead={lead_minutes:.0f}min) — rescheduling instead of predicting"
+            )
+            base_payload = {k: v for k, v in event.items() if k not in ("mode", "reschedule_count")}
+            base_payload["reschedule_count"] = reschedule_count + 1
+            schedule_race_jobs(date, race_no, official_dt, base_payload, suffix=f"-fix{reschedule_count + 1}")
+            msg = (
+                f"🕐 {player_name}（{RACER_NO}）{race_no}R 予想を再スケジュールしました\n"
+                f"📍 {venue_name}\n"
+                f"締切時刻が変更されたため（公式: {official_str}）、"
+                f"{(official_dt - timedelta(minutes=PRE_RACE_LEAD_MINUTES)).strftime('%H:%M')} に改めて予想を配信します"
+            )
+            send_discord_message(msg)
+            return {"statusCode": 200, "body": msg}
+    if official_dt:
+        logger.info(f"Deadline verified for {race_no}R: official={official_str}")
 
     # 1. 直前データの取得（出走表・枠別・直前・オッズ）
     #    出走表はプロンプトの土台なので失敗したら例外で落とす（トップレベルでエラー通知）。
@@ -2768,7 +2866,26 @@ def post_race_handler(event, context):
     )
 
     if not race_result["trifecta"]:
-        msg = f"⚠️ {race_no}R の結果を取得できませんでした（レース中止またはデータ未反映の可能性）"
+        # 結果未反映（レース進行の遅れ等）→ 数分後に再取得を仕込む。
+        # リトライしないと収支が記録されず、日次集計・累計更新も欠落する
+        retry = int(event.get("retry", 0))
+        if retry < POST_RACE_MAX_RETRIES:
+            next_at = datetime.now(JST) + timedelta(minutes=POST_RACE_RETRY_MINUTES)
+            try:
+                create_one_time_schedule(
+                    schedule_name=f"post-race-{date}-{race_no}-retry{retry + 1}",
+                    fire_at_utc=next_at.astimezone(timezone.utc),
+                    payload={**{k: v for k, v in event.items() if k != "retry"}, "retry": retry + 1},
+                )
+                msg = (
+                    f"⏳ {race_no}R の結果がまだ反映されていません"
+                    f"（{next_at.strftime('%H:%M')} に再取得します {retry + 1}/{POST_RACE_MAX_RETRIES}）"
+                )
+            except Exception as e:
+                logger.error(f"Failed to schedule post_race retry: {e}")
+                msg = f"⚠️ {race_no}R の結果を取得できず、再取得の予約にも失敗しました: {e}"
+        else:
+            msg = f"⚠️ {race_no}R の結果を取得できませんでした（レース中止またはデータ未反映の可能性）"
         send_discord_message(msg)
         return {"statusCode": 200, "body": msg}
 
