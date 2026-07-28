@@ -9,6 +9,8 @@
   python scripts/debug_scraper.py dbcareer [regno]             # boatrace-db キャリア通算成績
   python scripts/debug_scraper.py kako3 [regno]                # 競艇日和 過去3節成績
   python scripts/debug_scraper.py kycourse [regno] [course]    # 競艇日和 コース別成績（期間別・グレード別）
+  python scripts/debug_scraper.py deadline [jcd] [date]        # 公式締切パース＋競艇日和との突き合わせ
+  python scripts/debug_scraper.py drift                        # 締切ズレ検知（自己修復）の判定ロジック検証
   python scripts/debug_scraper.py betengine                    # ベットエンジンのオフライン検証
   python scripts/debug_scraper.py prompt [jcd] [rno] [date]    # 予想プロンプト全文を組み立てて表示
 """
@@ -97,6 +99,10 @@ from scraper import (
     parse_recent_series,
     parse_kyoteibiyori_course_stats,
     extract_course_summary,
+    fetch_official_deadlines,
+    parse_deadline_time,
+    PRE_RACE_LEAD_MINUTES,
+    DEADLINE_DRIFT_TOLERANCE_MINUTES,
     build_race_enrichment,
     build_system_prompt,
     build_user_prompt,
@@ -263,7 +269,7 @@ def debug_dbcareer():
         if name in career["venues"]:
             v = career["venues"][name]
             print(f"  {name}: 出走{v['starts']} 1着率{v['win_rate']}% 優勝{v['yusho']}回")
-    print(f"=== グレード別 ===")
+    print("=== グレード別 ===")
     for g, v in career["grades"].items():
         print(f"  {g}: 1着率{v['win_rate']}% 2連対率{v['top2_rate']}% 優勝{v['yusho']}回")
     assert len(career["courses"]) == 6 and career["venues"] and career["grades"]
@@ -308,6 +314,59 @@ def debug_kako3():
             print(f"    {r['day']} {r['race']} {r['name']}: 枠{r['waku']} 進入{r['entry']} 着{r['finish']} ST{r['st']}")
     assert series, "過去3節が抽出できず"
     print("PASS: 過去3節を抽出")
+
+
+def debug_deadline():
+    """公式(boatrace.jp raceindex)の締切時刻パース＋競艇日和との突き合わせ"""
+    jcd = sys.argv[2] if len(sys.argv) >= 3 else "11"
+    hd = sys.argv[3] if len(sys.argv) >= 4 else _jst_today()
+
+    official = fetch_official_deadlines(jcd, hd)
+    print(f"=== 公式締切（jcd={jcd} {hd}） ===")
+    for rno in sorted(official):
+        print(f"  {rno}R: {official[rno]}")
+    assert official, "締切を1件も取得できず"
+    assert all(parse_deadline_time(v, hd) for v in official.values()), "パースできない時刻がある"
+    print(f"PASS: {len(official)}レース分を抽出")
+
+    # 競艇日和側（対象選手の出走予定）と突き合わせ
+    data = parse_racer_page(fetch_racer_page(RACER_NO))
+    if not data["has_schedule"]:
+        print("\n（本日出走予定なし — 突き合わせはスキップ）")
+        return
+    print("\n=== 競艇日和 vs 公式 ===")
+    for row in data["race_rows"]:
+        if len(row) < 3:
+            continue
+        rno = int(row[0].replace("R", ""))
+        ky, off = row[2], official.get(rno)
+        mark = "一致" if ky == off else f"⚠️ 不一致（公式を採用: {off}）"
+        print(f"  {rno}R: 競艇日和={ky} / 公式={off} → {mark}")
+
+
+def debug_drift():
+    """締切ズレ検知ロジックのシミュレーション（自己修復の発動条件）"""
+    from datetime import datetime, timedelta, timezone
+
+    JST = timezone(timedelta(hours=9))
+    now = datetime.now(JST)
+    print(f"判定式: 公式締切までの残り分 > {PRE_RACE_LEAD_MINUTES} + {DEADLINE_DRIFT_TOLERANCE_MINUTES} なら再スケジュール\n")
+    cases = [
+        ("正常発火（締切10分前）", 10, False),
+        ("わずかな遅延（14分前）", 14, False),
+        ("境界（15分前）", 15, False),
+        ("締切が後ろにズレた（16分前）", 16, True),
+        ("今回の障害相当（43分前）", 43, True),
+        ("発火が遅れた（締切後2分）", -2, False),
+    ]
+    for label, lead, expected in cases:
+        deadline = now + timedelta(minutes=lead)
+        actual = (deadline - now).total_seconds() / 60 > PRE_RACE_LEAD_MINUTES + DEADLINE_DRIFT_TOLERANCE_MINUTES
+        status = "OK" if actual == expected else "NG"
+        action = "再スケジュール" if actual else "そのまま予想"
+        print(f"  [{status}] {label}: 残り{lead}分 → {action}")
+        assert actual == expected, f"{label} の判定が想定と異なる"
+    print("\nPASS: 全ケースが想定どおり")
 
 
 def debug_betengine():
@@ -456,6 +515,10 @@ if __name__ == "__main__":
         debug_kako3()
     elif mode == "kycourse":
         debug_kycourse()
+    elif mode == "deadline":
+        debug_deadline()
+    elif mode == "drift":
+        debug_drift()
     elif mode == "betengine":
         debug_betengine()
     elif mode == "prompt":
