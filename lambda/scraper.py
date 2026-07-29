@@ -49,7 +49,7 @@ RACE_BUDGET = int(os.environ.get("RACE_BUDGET", "5000"))  # 1レースあたり�
 JST = timezone(timedelta(hours=9))
 MODEL_ID = "us.anthropic.claude-sonnet-4-6"
 KYOTEIBIYORI_BASE = "https://kyoteibiyori.com/racer/racer_no"
-KYOTEIBIYORI_RACE_BASE = "https://kyoteibiyori.com/race_shusso.php"
+# NOTE: 競艇日和のレース単位ページ（race_shusso.php）はタブ内容をJSで描画する空殻のため使用しない
 BOATRACE_BASE = "https://www.boatrace.jp/owpc/pc/race"
 BOATRACE_DB_BASE = "https://boatrace-db.net"
 
@@ -58,7 +58,9 @@ EV_THRESHOLD = float(os.environ.get("EV_THRESHOLD", "1.10"))  # 購入する最�
 PROB_FLOOR = float(os.environ.get("PROB_FLOOR", "0.03"))  # 買い目の最低確率（的中率ガード）
 BLEND_LAMBDA = float(os.environ.get("BLEND_LAMBDA", "0.5"))  # モデル確率と市場確率のブレンド比
 MAX_BETS = int(os.environ.get("MAX_BETS", "5"))  # 最大点数
-PROMPT_VERSION = 2  # 予想プロンプトの版数（DynamoDB に記録して後から分析可能にする）
+PROMPT_VERSION = 3  # 予想プロンプトの版数（DynamoDB に記録して後から分析可能にする）
+# v3 (2026-07-29): 直前情報を公式beforeinfoに切替・枠別情報セクション廃止
+#（競艇日和 race_shusso.php はJS描画の空殻で、v2まで両セクションは実質空だった）
 
 # --- スケジューリング定数 ---
 PRE_RACE_LEAD_MINUTES = 10  # 予想は締切の何分前に出すか
@@ -609,6 +611,15 @@ def fetch_and_extract_text(url: str, max_length: int = 6000, retries: int = 2) -
     """URLのHTMLを取得してテキストに変換する"""
     html = fetch_page(url, retries=retries)
     return extract_text_from_html(html, max_length=max_length)
+
+
+def beforeinfo_has_data(text: str) -> bool:
+    """直前情報テキストに展示航走データが含まれているかの簡易判定。
+
+    展示タイム（6.74等）やスタート展示ST（2.09等）は「d.dd」形式で多数現れる。
+    展示未実施の時間帯はこれらのセルが空になるため、出現数で判定する。
+    """
+    return len(re.findall(r"\d\.\d{2}", text)) >= 5
 
 
 # =============================================
@@ -1615,10 +1626,7 @@ def build_user_prompt(race_ctx: dict) -> str:
 【出走表（boatrace.jp）】
 {race_ctx.get("racelist_text", "")}
 
-【枠別情報（競艇日和）】
-{race_ctx.get("wakubetsu_text", "")}
-
-【直前情報（展示タイム・スタート展示・部品交換・天候風）】
+【直前情報（展示タイム・チルト・スタート展示・部品交換・水面気象）】
 {race_ctx.get("beforeinfo_text", "")}
 
 以下のJSON形式のみで出力:
@@ -2651,31 +2659,27 @@ def pre_race_handler(event, context):
     if official_dt:
         logger.info(f"Deadline verified for {race_no}R: official={official_str}")
 
-    # 1. 直前データの取得（出走表・枠別・直前・オッズ）
+    # 1. 直前データの取得（出走表・直前・オッズ）
     #    出走表はプロンプトの土台なので失敗したら例外で落とす（トップレベルでエラー通知）。
     #    それ以外は欠落として続行する。
-    # 4フェッチとも retries=1（2試行×20秒）に制限 — 全滅しても計170秒程度に収め、
+    # 各フェッチとも retries=1（2試行×20秒）に制限 — 全滅しても計130秒程度に収め、
     # Bedrock 呼び出し込みで Lambda の300秒制限内に必ず収まるようにする
     racelist_url = f"{BOATRACE_BASE}/racelist?rno={race_no}&jcd={jcd}&hd={date}"
     logger.info(f"Fetching racelist: {racelist_url}")
     racelist_text = fetch_and_extract_text(racelist_url, retries=1)
     time.sleep(1)
 
-    place_no = int(jcd)
-    wakubetsu_url = f"{KYOTEIBIYORI_RACE_BASE}?place_no={place_no}&race_no={race_no}&hiduke={date}&slider=1"
-    logger.info(f"Fetching wakubetsu (kyoteibiyori): {wakubetsu_url}")
-    try:
-        wakubetsu_text = fetch_and_extract_text(wakubetsu_url, max_length=6000, retries=1)
-    except Exception as e:
-        logger.warning(f"wakubetsu fetch failed: {e}")
-        wakubetsu_text = "（取得失敗）"
-        data_warnings.append("枠別情報")
-    time.sleep(1)
-
-    beforeinfo_url = f"{KYOTEIBIYORI_RACE_BASE}?place_no={place_no}&race_no={race_no}&hiduke={date}&slider=4"
-    logger.info(f"Fetching beforeinfo (kyoteibiyori): {beforeinfo_url}")
+    # 直前情報は boatrace.jp 公式から取得する。
+    # 競艇日和の race_shusso.php はタブ内容を JavaScript で描画するため
+    # サーバーHTMLはナビだけの空殻で、urllib では中身が取れない（2026-07-29 判明）
+    beforeinfo_url = f"{BOATRACE_BASE}/beforeinfo?rno={race_no}&jcd={jcd}&hd={date}"
+    logger.info(f"Fetching beforeinfo (official): {beforeinfo_url}")
     try:
         beforeinfo_text = fetch_and_extract_text(beforeinfo_url, retries=1)
+        if not beforeinfo_has_data(beforeinfo_text):
+            logger.warning(f"beforeinfo page has no exhibition data yet: {beforeinfo_url}")
+            data_warnings.append("直前情報（展示未掲載）")
+            beforeinfo_text += "\n（注: 展示航走のデータがまだ掲載されていません）"
     except Exception as e:
         logger.warning(f"beforeinfo fetch failed: {e}")
         beforeinfo_text = "（取得失敗）"
@@ -2745,7 +2749,6 @@ def pre_race_handler(event, context):
         "player_name": player_name,
         "racer_data": racer_data or {},
         "racelist_text": racelist_text,
-        "wakubetsu_text": wakubetsu_text,
         "beforeinfo_text": beforeinfo_text,
     }
     prediction = invoke_bedrock_prediction(race_ctx)
