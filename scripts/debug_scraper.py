@@ -10,6 +10,7 @@
   python scripts/debug_scraper.py kako3 [regno]                # 競艇日和 過去3節成績
   python scripts/debug_scraper.py kycourse [regno] [course]    # 競艇日和 コース別成績（期間別・グレード別）
   python scripts/debug_scraper.py deadline [jcd] [date]        # 公式締切パース＋競艇日和との突き合わせ
+  python scripts/debug_scraper.py beforeinfo [jcd] [rno] [date]  # 公式直前情報の取得＋展示データ有無判定
   python scripts/debug_scraper.py drift                        # 締切ズレ検知（自己修復）の判定ロジック検証
   python scripts/debug_scraper.py betengine                    # ベットエンジンのオフライン検証
   python scripts/debug_scraper.py prompt [jcd] [rno] [date]    # 予想プロンプト全文を組み立てて表示
@@ -91,8 +92,8 @@ from scraper import (
     fetch_page,
     VENUE_CODE_MAP,
     BOATRACE_BASE,
-    KYOTEIBIYORI_RACE_BASE,
     RACER_NO,
+    beforeinfo_has_data,
     parse_racelist_entries,
     fetch_course_matrix,
     fetch_racer_career,
@@ -369,6 +370,22 @@ def debug_drift():
     print("\nPASS: 全ケースが想定どおり")
 
 
+def debug_beforeinfo():
+    """公式beforeinfoの取得＋展示データ有無の判定テスト"""
+    jcd = sys.argv[2] if len(sys.argv) >= 3 else "11"
+    rno = sys.argv[3] if len(sys.argv) >= 4 else "1"
+    hd = sys.argv[4] if len(sys.argv) >= 5 else _jst_today()
+
+    url = f"{BOATRACE_BASE}/beforeinfo?rno={rno}&jcd={jcd}&hd={hd}"
+    print(f"Fetching: {url}")
+    text = fetch_and_extract_text(url)
+    has_data = beforeinfo_has_data(text)
+    print(f"抽出テキスト: {len(text)}字 / 展示データ: {'あり' if has_data else 'なし（未掲載）'}")
+    # データ部分（ナビ以降）を表示
+    i = text.find("直前情報")
+    print(text[i:] if i >= 0 else text[:2500])
+
+
 def debug_betengine():
     """ベットエンジンのオフライン検証（缶詰の確率 + 合成オッズ）"""
     # モデル: 2号艇の差しを高評価（1号艇の信頼度は市場より低い見立て）
@@ -471,14 +488,9 @@ def debug_prompt():
 
     racelist_text = fetch_and_extract_text(f"{BOATRACE_BASE}/racelist?rno={rno}&jcd={jcd}&hd={hd}")
     time.sleep(1)
-    place_no = int(jcd)
-    wakubetsu_text = fetch_and_extract_text(
-        f"{KYOTEIBIYORI_RACE_BASE}?place_no={place_no}&race_no={rno}&hiduke={hd}&slider=1", max_length=6000
-    )
-    time.sleep(1)
-    beforeinfo_text = fetch_and_extract_text(
-        f"{KYOTEIBIYORI_RACE_BASE}?place_no={place_no}&race_no={rno}&hiduke={hd}&slider=4"
-    )
+    beforeinfo_text = fetch_and_extract_text(f"{BOATRACE_BASE}/beforeinfo?rno={rno}&jcd={jcd}&hd={hd}")
+    if not beforeinfo_has_data(beforeinfo_text):
+        beforeinfo_text += "\n（注: 展示航走のデータがまだ掲載されていません）"
 
     race_ctx = {
         "race_no": rno,
@@ -488,7 +500,6 @@ def debug_prompt():
         "player_name": page.get("player_name") or f"選手{RACER_NO}",
         "racer_data": enrichment,
         "racelist_text": racelist_text,
-        "wakubetsu_text": wakubetsu_text,
         "beforeinfo_text": beforeinfo_text,
     }
 
@@ -521,6 +532,8 @@ if __name__ == "__main__":
         debug_drift()
     elif mode == "betengine":
         debug_betengine()
+    elif mode == "beforeinfo":
+        debug_beforeinfo()
     elif mode == "prompt":
         debug_prompt()
     else:
