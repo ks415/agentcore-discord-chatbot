@@ -152,7 +152,7 @@ def fetch_race_info(url: str) -> str:
 
     【kyoteibiyori.com（競艇日和）】
     - 選手情報: https://kyoteibiyori.com/racer/racer_no/{選手番号}
-    - 出走表: https://kyoteibiyori.com/race_shusso.php?place_no={会場コード}&hiduke={yyyymmdd}&race_no={R番号}
+    ※ レース単位ページ（race_shusso.php）はJavaScript描画のためテキスト抽出不可。使わないこと
 
     【boatrace-db.net（艇国データバンク）】
     - キャリア通算成績（コース別・場別・グレード別）: https://boatrace-db.net/racer/aresult/regno/{選手番号}/

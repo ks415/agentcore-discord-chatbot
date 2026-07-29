@@ -104,6 +104,7 @@ EventBridge Rule (毎朝 JST 8:00)
 - セッション管理は `channel_id` を `runtimeSessionId` として使い、AgentCore が同じコンテナにルーティング。コンテナのアイドルタイムアウト（15分）で自動破棄
 - **boatrace-db.net は AWS データセンターのIPを遮断している**（Lambda からは接続タイムアウト、ローカルからは成功）。対象選手固有のデータ（条件付き分布・キャリア）は `scripts/refresh_racerdb_cache.py` を**月1回ローカルPCから実行**して DynamoDB の静的キャッシュ（`static#matrix#{course}` / `static#career`）に投入する。Lambda はキャッシュ優先で読み、45日以上古いと警告ログを出す
 - 対戦相手のコース別成績・直近節は競艇日和のレーサーページ（Lambda から到達可能）から取得する（`parse_kyoteibiyori_course_stats`）。期間別に加え「一般戦/SG|G1」のグレード別コース成績も取れる
+- **競艇日和のレース単位ページ（race_shusso.php）はタブ内容をJSで描画する空殻**で、urllib ではナビ以外取れない（2026-07-29 判明。それまで枠別・直前セクションは実質空だった）。直前情報は公式 `boatrace.jp/owpc/pc/race/beforeinfo` から取得し、`beforeinfo_has_data()` で展示データの有無を検証する。レーサーページ（racer/racer_no/…）はサーバー描画なので引き続き使用可
 - **boatrace-db.net は Accept-Encoding 無指定でも gzip を強制配信する**。`fetch_page` はマジックバイト（`1f 8b`）検知で自動展開する実装になっており、これを外すと UnicodeDecodeError で落ちる
 - **フェッチのタイムアウト設計**: boatrace.jp はナイター帯に TTFB 9〜10秒まで落ちるため既定20秒。ハングする boatrace-db.net へは短い timeout（8秒）とリトライなしを明示。リトライの積み上げで Lambda の300秒を超えないよう、pre_race の基本4フェッチは retries=1 に制限（2026-07-13 の schedule タイムアウト障害の教訓）
 - `_to_dynamodb_item` は `default=float` で Decimal を含むデータの再保存に対応している（静的キャッシュから読んだ Decimal が racerdata 保存経路に流れるため。外すと "Object of type Decimal is not JSON serializable" で落ちる）
