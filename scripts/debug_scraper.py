@@ -88,12 +88,15 @@ from scraper import (
     parse_racer_page,
     extract_venue_name,
     fetch_and_extract_text,
+    extract_text_from_html,
     parse_result_list,
     fetch_page,
     VENUE_CODE_MAP,
     BOATRACE_BASE,
     RACER_NO,
     beforeinfo_has_data,
+    parse_beforeinfo_details,
+    apply_formation_to_racer_data,
     parse_racelist_entries,
     fetch_course_matrix,
     fetch_racer_career,
@@ -378,12 +381,22 @@ def debug_beforeinfo():
 
     url = f"{BOATRACE_BASE}/beforeinfo?rno={rno}&jcd={jcd}&hd={hd}"
     print(f"Fetching: {url}")
-    text = fetch_and_extract_text(url)
+    html = fetch_page(url)
+    text = extract_text_from_html(html)
     has_data = beforeinfo_has_data(text)
     print(f"抽出テキスト: {len(text)}字 / 展示データ: {'あり' if has_data else 'なし（未掲載）'}")
-    # データ部分（ナビ以降）を表示
-    i = text.find("直前情報")
-    print(text[i:] if i >= 0 else text[:2500])
+
+    details = parse_beforeinfo_details(html)
+    print(f"\n=== 構造化パース ===")
+    print(f"boats ({len(details['boats'])}艇):")
+    for waku, b in sorted(details["boats"].items()):
+        print(f"  {waku}号艇 {b['name']}: 展示{b['tenji_time']} チルト{b['tilt']}")
+    print(f"formation ({len(details['formation'])}行):")
+    wakunari = all(f["course"] == f["waku"] for f in details["formation"])
+    for f in details["formation"]:
+        print(f"  {f['course']}コース: {f['waku']}号艇 ST{f['st']}")
+    if details["formation"]:
+        print(f"→ {'枠なり' if wakunari else '⚠️ 進入変化あり'}")
 
 
 def debug_betengine():
@@ -488,9 +501,12 @@ def debug_prompt():
 
     racelist_text = fetch_and_extract_text(f"{BOATRACE_BASE}/racelist?rno={rno}&jcd={jcd}&hd={hd}")
     time.sleep(1)
-    beforeinfo_text = fetch_and_extract_text(f"{BOATRACE_BASE}/beforeinfo?rno={rno}&jcd={jcd}&hd={hd}")
+    beforeinfo_html = fetch_page(f"{BOATRACE_BASE}/beforeinfo?rno={rno}&jcd={jcd}&hd={hd}")
+    beforeinfo_text = extract_text_from_html(beforeinfo_html)
     if not beforeinfo_has_data(beforeinfo_text):
         beforeinfo_text += "\n（注: 展示航走のデータがまだ掲載されていません）"
+    details = parse_beforeinfo_details(beforeinfo_html)
+    apply_formation_to_racer_data(enrichment, details.get("formation") or [])
 
     race_ctx = {
         "race_no": rno,

@@ -58,9 +58,11 @@ EV_THRESHOLD = float(os.environ.get("EV_THRESHOLD", "1.10"))  # 購入する最�
 PROB_FLOOR = float(os.environ.get("PROB_FLOOR", "0.03"))  # 買い目の最低確率（的中率ガード）
 BLEND_LAMBDA = float(os.environ.get("BLEND_LAMBDA", "0.5"))  # モデル確率と市場確率のブレンド比
 MAX_BETS = int(os.environ.get("MAX_BETS", "5"))  # 最大点数
-PROMPT_VERSION = 3  # 予想プロンプトの版数（DynamoDB に記録して後から分析可能にする）
+PROMPT_VERSION = 4  # 予想プロンプトの版数（DynamoDB に記録して後から分析可能にする）
 # v3 (2026-07-29): 直前情報を公式beforeinfoに切替・枠別情報セクション廃止
 #（競艇日和 race_shusso.php はJS描画の空殻で、v2まで両セクションは実質空だった）
+# v4 (2026-07-31): スタート展示の進入隊形セクションを追加。前づけ時は
+# コース別データ（マトリクス・期間別サマリ・相手コース別成績）を実コースへ差し替え
 
 # --- スケジューリング定数 ---
 PRE_RACE_LEAD_MINUTES = 10  # 予想は締切の何分前に出すか
@@ -620,6 +622,120 @@ def beforeinfo_has_data(text: str) -> bool:
     展示未実施の時間帯はこれらのセルが空になるため、出現数で判定する。
     """
     return len(re.findall(r"\d\.\d{2}", text)) >= 5
+
+
+def parse_beforeinfo_details(html: str) -> dict:
+    """公式beforeinfoページから構造化データ（艇別情報・スタート展示の進入隊形）を抽出する。
+
+    スタート展示テーブルは「進入コース順」の行で構成され、
+    行内の `is-type(\\d)` クラスが艇番、`table1_boatImage1Time` が展示ST。
+    展示未実施の時間帯は formation が空になる。
+
+    返り値: {
+      "boats": {艇番: {"name": str, "tenji_time": float|None, "tilt": float|None}},
+      "formation": [{"course": 進入コース, "waku": 艇番, "st": "F.10"等}, ...],
+    }
+    """
+    boats: dict[int, dict] = {}
+    for block in re.findall(r"<tbody[^>]*class=\"[^\"]*is-fs12[^\"]*\"[^>]*>(.*?)</tbody>", html, re.S):
+        rows = _table_rows(block)
+        if not rows or not rows[0]:
+            continue
+        cells = rows[0]
+        waku_num = _to_number(cells[0])
+        if waku_num is None or not (1 <= int(waku_num) <= 6):
+            continue
+        name_m = re.search(r'toban=\d+"[^>]*>([^<]+)</a>', block)
+        name = re.sub(r"[\s　]+", "", name_m.group(1)) if name_m else (cells[2] if len(cells) > 2 else "")
+        name = re.sub(r"[\s　]+", "", name)
+        tenji = _to_number(cells[4]) if len(cells) > 4 else None
+        tilt = _to_number(cells[5]) if len(cells) > 5 else None
+        boats[int(waku_num)] = {"name": name, "tenji_time": tenji, "tilt": tilt}
+
+    formation: list[dict] = []
+    start_section = html[html.find("スタート展示") :] if "スタート展示" in html else ""
+    for idx, block in enumerate(
+        re.findall(r'<div class="table1_boatImage1">(.*?)</div>', start_section, re.S), start=1
+    ):
+        num_m = re.search(r"table1_boatImage1Number\s+is-type(\d)", block)
+        if not num_m:
+            continue
+        st_m = re.search(r"table1_boatImage1Time[^>]*>([^<]*)<", block)
+        formation.append(
+            {
+                "course": idx,
+                "waku": int(num_m.group(1)),
+                "st": (st_m.group(1).strip() if st_m else ""),
+            }
+        )
+
+    return {"boats": boats, "formation": formation}
+
+
+def apply_formation_to_racer_data(racer_data: dict, formation: list[dict]) -> list[str]:
+    """スタート展示の進入隊形を racer_data に反映する。
+
+    枠なり想定で先読みしたコース別データ（池田マトリクス・期間別サマリ・相手のコース別成績）を、
+    実際の進入コースのものに差し替える。返り値は変更メモのリスト（ログ・通知用）。
+    進入変化がなければ何もしない。
+    """
+    notes: list[str] = []
+    if not racer_data or not formation:
+        return notes
+    course_of = {int(f["waku"]): int(f["course"]) for f in formation}
+    racer_data["formation"] = formation
+    changed = [(w, c) for w, c in course_of.items() if w != c]
+    racer_data["formation_changed"] = bool(changed)
+    if not changed:
+        return notes
+
+    for waku, course in sorted(changed):
+        notes.append(f"{waku}号艇が{course}コース進入")
+    logger.info(f"Start formation changed: {', '.join(notes)}")
+
+    # 対象選手のマトリクス・期間別サマリを実コースのものへ差し替え
+    ikeda_waku = racer_data.get("ikeda_waku")
+    actual = course_of.get(int(ikeda_waku)) if ikeda_waku else None
+    if ikeda_waku and actual and actual != int(ikeda_waku):
+        racer_data["ikeda_course"] = actual
+        matrix = load_static_matrix(actual)
+        if matrix is None:
+            matrix = fetch_course_matrix(RACER_NO, actual)
+        if matrix:
+            racer_data["ikeda_matrix"] = matrix
+        try:
+            racer_html = fetch_racer_page(RACER_NO)
+            time.sleep(1)
+            stats = parse_kyoteibiyori_course_stats(racer_html)
+            summary = extract_course_summary(stats, actual)
+            if summary:
+                racer_data["ikeda_course_summary"] = summary
+        except Exception as e:
+            logger.warning(f"ikeda course summary refetch failed: {e}")
+
+    # 進入が変わった相手のコース別成績を実コースのものへ差し替え
+    opponents = racer_data.get("opponents") or {}
+    for entry in racer_data.get("entries") or []:
+        regno = str(entry["regno"])
+        waku = int(entry["waku"])
+        course = course_of.get(waku, waku)
+        opponent = opponents.get(regno)
+        if opponent is None:
+            continue
+        opponent["course"] = course
+        if regno == RACER_NO or course == waku:
+            continue
+        try:
+            opponent_html = fetch_page(f"{KYOTEIBIYORI_BASE}/{regno}", retries=0)
+            time.sleep(1)
+            stats = parse_kyoteibiyori_course_stats(opponent_html)
+            summary = extract_course_summary(stats, course)
+            if summary:
+                opponent["course_stats"] = summary
+        except Exception as e:
+            logger.warning(f"opponent course stats refetch failed (regno={regno}): {e}")
+
+    return notes
 
 
 # =============================================
@@ -1295,6 +1411,17 @@ def create_one_time_schedule(
         logger.info(f"Updated existing schedule: {schedule_name} at {schedule_expression}")
 
 
+def delete_schedule_if_exists(schedule_name: str) -> None:
+    """スケジュールを削除する（存在しなければ何もしない）"""
+    try:
+        scheduler_client.delete_schedule(Name=schedule_name, GroupName=SCHEDULER_GROUP_NAME)
+        logger.info(f"Deleted stale schedule: {schedule_name}")
+    except scheduler_client.exceptions.ResourceNotFoundException:
+        pass
+    except Exception as e:
+        logger.warning(f"delete_schedule failed ({schedule_name}): {e}")
+
+
 def schedule_race_jobs(today: str, race_no: int, deadline_dt: datetime, base_payload: dict, suffix: str = "") -> int:
     """1レース分の pre_race / post_race スケジュールを作成する（過去時刻はスキップ）。
 
@@ -1509,6 +1636,34 @@ def _fmt_period_line(label: str, p: dict) -> str:
     )
 
 
+_BOAT_MARKS = "①②③④⑤⑥"
+
+
+def _fmt_formation_lines(racer_data: dict | None) -> tuple[list[str], bool]:
+    """スタート展示の進入隊形（コース順に艇番・レーサー名・展示ST）を行リストにする。
+
+    返り値: (行リスト, 進入変化ありか)。スタート展示が無い場合は
+    出走表（枠なり想定）から組み立てて (行リスト, False) を返す。
+    """
+    racer_data = racer_data or {}
+    formation = racer_data.get("formation") or []
+    entries = racer_data.get("entries") or []
+    names = {int(e["waku"]): e.get("name", "") for e in entries}
+    lines: list[str] = []
+    if formation:
+        for f in formation:
+            waku = int(f["waku"])
+            mark = _BOAT_MARKS[waku - 1] if 1 <= waku <= 6 else str(waku)
+            st = f"  ST{f['st']}" if f.get("st") else ""
+            lines.append(f"{int(f['course'])}コース {mark}{names.get(waku, '')}{st}")
+        return lines, bool(racer_data.get("formation_changed"))
+    for e in sorted(entries, key=lambda x: int(x["waku"])):
+        waku = int(e["waku"])
+        mark = _BOAT_MARKS[waku - 1] if 1 <= waku <= 6 else str(waku)
+        lines.append(f"{waku}コース {mark}{e.get('name', '')}")
+    return lines, False
+
+
 def _fmt_opponents_block(racer_data: dict | None, player_name: str, grade: str = "一般") -> str:
     entries = (racer_data or {}).get("entries") or []
     opponents = (racer_data or {}).get("opponents") or {}
@@ -1523,7 +1678,9 @@ def _fmt_opponents_block(racer_data: dict | None, player_name: str, grade: str =
             lines.append(f"{waku}号艇 {e['name']}（{e['klass']}） ※対象選手本人")
             continue
         opp = opponents.get(regno) or {}
-        header = f"{waku}号艇 {e['name']}（{e['klass']}・登番{regno}）: {waku}コース進入"
+        entry_course = int(opp.get("course") or waku)
+        course_note = "（前づけで進入変化）" if entry_course != waku else ""
+        header = f"{waku}号艇 {e['name']}（{e['klass']}・登番{regno}）: {entry_course}コース進入{course_note}"
         periods = (opp.get("course_stats") or {}).get("periods") or {}
         if periods:
             lines.append(header)
@@ -1564,22 +1721,42 @@ def build_user_prompt(race_ctx: dict) -> str:
     player_name = race_ctx.get("player_name") or f"選手{RACER_NO}"
     racer_data = race_ctx.get("racer_data") or {}
     ikeda_waku = racer_data.get("ikeda_waku")
-    waku_text = f"{int(ikeda_waku)}号艇（{int(ikeda_waku)}コース進入想定）" if ikeda_waku else "不明（出走表テキストから判断）"
+    # 進入コース（スタート展示で変化した場合は実コース、通常は枠なり）
+    ikeda_course = int(racer_data.get("ikeda_course") or ikeda_waku) if ikeda_waku else None
+    if ikeda_waku and ikeda_course != int(ikeda_waku):
+        waku_text = f"{int(ikeda_waku)}号艇 ※スタート展示では{ikeda_course}コース進入（前づけ発生）"
+    elif ikeda_waku:
+        waku_text = f"{int(ikeda_waku)}号艇（{ikeda_course}コース進入想定）"
+    else:
+        waku_text = "不明（出走表テキストから判断）"
     career = racer_data.get("ikeda_career")
     matrix = racer_data.get("ikeda_matrix")
 
+    formation_lines, formation_changed = _fmt_formation_lines(racer_data)
+    if formation_lines and racer_data.get("formation"):
+        formation_block = "\n".join(formation_lines)
+        if formation_changed:
+            formation_block += (
+                "\n※ 進入が枠なりと異なります。確率は艇番（waku）単位で出力しますが、"
+                "各艇のベース率は上記の実際の進入コースで考えてください"
+            )
+    elif formation_lines:
+        formation_block = "\n".join(formation_lines) + "\n（スタート展示未実施のため枠なり想定）"
+    else:
+        formation_block = "（スタート展示未実施 — 枠なり想定で推定してください）"
+
     matrix_header = (
-        f"【{player_name}が{int(ikeda_waku)}コースに入ったレースの着順分布（直近6ヶ月・条件付きデータ）】\n"
-        f"※ {player_name}が{int(ikeda_waku)}コース進入時に、各コースの艇がどれだけ1着/2連対/3連対したか"
-        if ikeda_waku
+        f"【{player_name}が{ikeda_course}コースに入ったレースの着順分布（直近6ヶ月・条件付きデータ）】\n"
+        f"※ {player_name}が{ikeda_course}コース進入時に、各コースの艇がどれだけ1着/2連対/3連対したか"
+        if ikeda_course
         else f"【{player_name}の当該コース着順分布（直近6ヶ月）】"
     )
 
     summary_lines = _fmt_course_summary_lines(racer_data.get("ikeda_course_summary"), grade)
     course_summary_block = "\n".join(summary_lines) if summary_lines else _MISSING_DATA_NOTE
     course_summary_header = (
-        f"【{player_name} {int(ikeda_waku)}コースの期間別・グレード別成績（競艇日和）】"
-        if ikeda_waku
+        f"【{player_name} {ikeda_course}コースの期間別・グレード別成績（競艇日和）】"
+        if ikeda_course
         else f"【{player_name} 当該コースの期間別・グレード別成績】"
     )
 
@@ -1595,6 +1772,9 @@ def build_user_prompt(race_ctx: dict) -> str:
 【レース条件】
 - グレード: {grade}
 - {player_name}の枠: {waku_text}
+
+【進入予想（スタート展示）】
+{formation_block}
 
 【{player_name} コース別成績（キャリア通算）】
 {_fmt_career_courses_block(career)}
@@ -2069,6 +2249,7 @@ def save_prediction(
     player_name: str,
     grade: str = "一般",
     data_warnings: list[str] | None = None,
+    formation: list[dict] | None = None,
 ) -> None:
     """レース予想（LLM確率 + ベットエンジン出力）をDynamoDBに保存する。
 
@@ -2095,6 +2276,8 @@ def save_prediction(
             "engine_meta": engine_out.get("meta", {}),
             "engine_config": get_engine_config(),
             "data_warnings": data_warnings or [],
+            "formation": formation or [],
+            "formation_changed": bool(formation) and any(int(f["course"]) != int(f["waku"]) for f in formation),
         }
     )
     db_table.put_item(Item=item)
@@ -2130,6 +2313,12 @@ def save_result(
         }
     )
     db_table.put_item(Item=item)
+
+
+def get_result(today: str, race_no: int) -> dict | None:
+    """DynamoDBからレース結果を読み出す（post_raceの冪等ガード用）"""
+    response = db_table.get_item(Key={"racer_no": RACER_NO, "date_type": f"{today}#result#{race_no}"})
+    return response.get("Item")
 
 
 def get_all_results_for_day(today: str, race_nos: list[int]) -> list[dict]:
@@ -2246,6 +2435,7 @@ def build_pre_race_message(
     total_races: int,
     grade: str = "一般",
     data_warnings: list[str] | None = None,
+    racer_data: dict | None = None,
 ) -> str:
     """レース予想メッセージを組み立てる（購入 or 見送りの両対応）"""
     name = player_name or f"選手{RACER_NO}"
@@ -2259,6 +2449,17 @@ def build_pre_race_message(
     confidence = prediction.get("confidence")
     conf_text = f" ｜ AI確信度 {int(confidence)}/100" if confidence is not None else ""
     lines.append(f"📍 {venue_name} ｜ {grade}{conf_text}")
+
+    # 進入・出走表（スタート展示があれば実際の進入隊形、なければ枠なり想定）
+    formation_lines, formation_changed = _fmt_formation_lines(racer_data)
+    if formation_lines:
+        has_formation = bool((racer_data or {}).get("formation"))
+        lines.append("")
+        lines.append("【進入・出走表】" + ("" if has_formation else "（展示未実施・枠なり想定）"))
+        for line in formation_lines:
+            lines.append(f"  {line}")
+        if formation_changed:
+            lines.append("  ⚠️ 進入変化あり（枠なりと異なる隊形。データも実コースに差し替え済み）")
 
     if skipped:
         lines.append(f"⏸ 理由: {_skip_reason_text(engine_out)}")
@@ -2648,6 +2849,10 @@ def pre_race_handler(event, context):
             base_payload = {k: v for k, v in event.items() if k not in ("mode", "reschedule_count")}
             base_payload["reschedule_count"] = reschedule_count + 1
             schedule_race_jobs(date, race_no, official_dt, base_payload, suffix=f"-fix{reschedule_count + 1}")
+            # 旧締切で作られた post_race を削除する（残すと新旧2回発火して結果通知が重複し、
+            # 日次集計・累計も二重計上される — 2026-08-01 の障害の教訓）
+            old_suffix = "" if reschedule_count == 0 else f"-fix{reschedule_count}"
+            delete_schedule_if_exists(f"post-race-{date}-{race_no}{old_suffix}")
             msg = (
                 f"🕐 {player_name}（{RACER_NO}）{race_no}R 予想を再スケジュールしました\n"
                 f"📍 {venue_name}\n"
@@ -2674,8 +2879,11 @@ def pre_race_handler(event, context):
     # サーバーHTMLはナビだけの空殻で、urllib では中身が取れない（2026-07-29 判明）
     beforeinfo_url = f"{BOATRACE_BASE}/beforeinfo?rno={race_no}&jcd={jcd}&hd={date}"
     logger.info(f"Fetching beforeinfo (official): {beforeinfo_url}")
+    beforeinfo_details: dict = {}
     try:
-        beforeinfo_text = fetch_and_extract_text(beforeinfo_url, retries=1)
+        beforeinfo_html = fetch_page(beforeinfo_url, retries=1)
+        beforeinfo_text = extract_text_from_html(beforeinfo_html)
+        beforeinfo_details = parse_beforeinfo_details(beforeinfo_html)
         if not beforeinfo_has_data(beforeinfo_text):
             logger.warning(f"beforeinfo page has no exhibition data yet: {beforeinfo_url}")
             data_warnings.append("直前情報（展示未掲載）")
@@ -2739,6 +2947,15 @@ def pre_race_handler(event, context):
 
     grade = (racer_data or {}).get("grade") or "一般"
 
+    # 2.5 スタート展示の進入隊形を反映（前づけ等でコースが変わった場合、
+    #     枠なり想定で先読みしたコース別データを実コースのものへ差し替える）
+    racer_data = racer_data or {}
+    formation = beforeinfo_details.get("formation") or []
+    try:
+        apply_formation_to_racer_data(racer_data, formation)
+    except Exception as e:
+        logger.warning(f"apply_formation_to_racer_data failed: {e}")
+
     # 3. Bedrock で艇別の着順確率を推定（オッズは渡さない — 独立推定）
     logger.info(f"Invoking Bedrock for probability estimation ({race_no}R)...")
     race_ctx = {
@@ -2747,7 +2964,7 @@ def pre_race_handler(event, context):
         "date": date,
         "grade": grade,
         "player_name": player_name,
-        "racer_data": racer_data or {},
+        "racer_data": racer_data,
         "racelist_text": racelist_text,
         "beforeinfo_text": beforeinfo_text,
     }
@@ -2780,7 +2997,9 @@ def pre_race_handler(event, context):
     )
 
     # 5. DynamoDB 保存 + Discord 通知（見送りでも必ず両方行う）
-    save_prediction(date, race_no, prediction, engine_out, venue_name, jcd, player_name, grade, data_warnings)
+    save_prediction(
+        date, race_no, prediction, engine_out, venue_name, jcd, player_name, grade, data_warnings, formation
+    )
     msg = build_pre_race_message(
         player_name,
         venue_name,
@@ -2791,6 +3010,7 @@ def pre_race_handler(event, context):
         total_races,
         grade=grade,
         data_warnings=data_warnings,
+        racer_data=racer_data,
     )
     send_discord_message(msg)
     logger.info(f"Pre-race handler completed for {race_no}R")
@@ -2850,6 +3070,17 @@ def post_race_handler(event, context):
     race_index = event["race_index"]
 
     logger.info(f"Post-race handler: race_no={race_no}, venue={venue_name}, date={date}")
+
+    # 0. 冪等ガード: 既に結果が記録済みなら何もしない。
+    #    再スケジュールの取りこぼしやEventBridgeの重複配信で post_race が二重発火しても、
+    #    結果通知の重複と累計収支の二重計上を防ぐ（2026-08-01 の障害の教訓）。
+    #    手動で再実行したい場合は該当の {date}#result#{race_no} アイテムを削除してから invoke すること。
+    try:
+        if get_result(date, race_no):
+            logger.info(f"Result already recorded for {race_no}R — skipping duplicate post_race invocation")
+            return {"statusCode": 200, "body": f"{race_no}R result already recorded (duplicate invocation)"}
+    except Exception as e:
+        logger.warning(f"idempotency check failed (continuing): {e}")
 
     # 1. DynamoDB から予想を読み出し
     pred_item = get_prediction(date, race_no)
